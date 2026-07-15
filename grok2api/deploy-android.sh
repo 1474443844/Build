@@ -48,6 +48,15 @@ get_default_dir() {
     fi
 }
 
+get_current_port() {
+    local config_path="${INSTALL_DIR}/config.yaml"
+    local parsed_port="8000"
+    if [ -f "$config_path" ]; then
+        parsed_port=$(grep "listen:" "$config_path" | grep -oE "[0-9]+")
+    fi
+    LISTEN_PORT=${parsed_port:-"8000"}
+}
+
 save_dir_to_cache() {
     echo "$INSTALL_DIR" > "$PATH_CACHE_FILE"
 }
@@ -97,19 +106,104 @@ fetch_latest_release() {
     fi
 }
 
+interactive_configure() {
+    local config_path="$1"
+    echo -e "\n${BLUE}=================== Grok2API 交互式配置助手 ===================${PLAIN}"
+
+    # 1. 端口
+    read -p "请输入服务运行端口 [默认: 8000]: " input_port < /dev/tty
+    local port=${input_port:-"8000"}
+
+    # 2. 用户名
+    read -p "请输入管理员用户名 [默认: admin]: " admin_user < /dev/tty
+    admin_user=${admin_user:-"admin"}
+
+    # 3. 密码
+    read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
+    local is_random=false
+    if [ -z "$admin_pass" ]; then
+        admin_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+        is_random=true
+    fi
+
+    # 4. 存储 (安卓暂不推荐PG驱动，但脚本予以保留)
+    echo -e "\n请选择数据库存储驱动类型："
+    echo -e "  1. SQLite (推荐，移动端完全单机运行)"
+    echo -e "  2. PostgreSQL"
+    read -p "请选择驱动 [1-2, 默认: 1]: " db_choice < /dev/tty
+    local db_driver="sqlite"
+    local pg_dsn="postgres://user:password@127.0.0.1:5432/grok2api?sslmode=disable"
+    if [ "$db_choice" = "2" ]; then
+        db_driver="postgres"
+        read -p "请输入 PostgreSQL DSN 连接串: " input_dsn < /dev/tty
+        pg_dsn=${input_dsn:-"$pg_dsn"}
+    fi
+
+    # 5. 缓存
+    echo -e "\n请选择缓存驱动类型："
+    echo -e "  1. Memory (轻量、不占额外内存)"
+    echo -e "  2. Redis"
+    read -p "请选择驱动 [1-2, 默认: 1]: " store_choice < /dev/tty
+    local store_driver="memory"
+    local redis_addr="127.0.0.1:6379"
+    local redis_pass=""
+    if [ "$store_choice" = "2" ]; then
+        store_driver="redis"
+        read -p "请输入 Redis 地址 [默认: $redis_addr]: " input_redis_addr < /dev/tty
+        redis_addr=${input_redis_addr:-"$redis_addr"}
+        read -p "请输入 Redis 密码 [默认: 无]: " input_redis_pass < /dev/tty
+        redis_pass=${input_redis_pass:-""}
+    fi
+
+    # 6. 随机密钥
+    local jwt_secret enc_key
+    jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
+    enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
+
+    cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
+
+    safe_sed() {
+        sed -i "s|$1|$2|g" "$config_path"
+    }
+
+    safe_sed 'listen: "127.0.0.1:8000"' "listen: \"0.0.0.0:${port}\""
+    safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
+    safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
+    safe_sed 'username: "admin"' "username: \"${admin_user}\""
+    safe_sed 'password: "replace-with-a-strong-password"' "password: \"${admin_pass}\""
+    
+    safe_sed 'driver: sqlite # sqlite | postgres' "driver: ${db_driver} # sqlite \| postgres"
+    if [ "$db_driver" = "postgres" ]; then
+        safe_sed 'dsn: "postgres://user:password@127.0.0.1:5432/grok2api.*"' "dsn: \"${pg_dsn}\""
+    fi
+
+    safe_sed 'driver: memory # memory | redis' "driver: ${store_driver} # memory \| redis"
+    if [ "$store_driver" = "redis" ]; then
+        safe_sed 'address: "127.0.0.1:6379"' "address: \"${redis_addr}\""
+        safe_sed 'password: ""' "password: \"${redis_pass}\""
+    fi
+
+    echo -e "${GREEN}🎉 config.yaml 写入完毕！${PLAIN}"
+    echo -e "${YELLOW}======================================================="
+    echo -e " 🚀 初始管理员凭证已写入配置文件："
+    echo -e " 初始账户: ${admin_user}"
+    echo -e " 初始密码: ${admin_pass}"
+    [ "$is_random" = "true" ] && echo -e " (提示: 这是系统随机密码，已安全保存！)"
+    echo -e "=======================================================${PLAIN}"
+}
+
 start_service() {
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
         echo -e "${BLUE}服务已在后台运行中 (PID: $(cat "$PID_FILE"))。${PLAIN}"
         return
     fi
     
-    local port
-    read -p "请输入服务运行端口 [默认: 8000]: " port < /dev/tty
-    port=${port:-"8000"}
+    get_current_port
 
-    nohup "${INSTALL_DIR}/grok2api" --config "${INSTALL_DIR}/config.yaml" --listen "0.0.0.0:${port}" > "${INSTALL_DIR}/output.log" 2>&1 &
+    nohup "${INSTALL_DIR}/grok2api" --config "${INSTALL_DIR}/config.yaml" > "${INSTALL_DIR}/output.log" 2>&1 &
     echo $! > "$PID_FILE"
     echo -e "${GREEN}服务已成功在后台启动！当前 PID: $!${PLAIN}"
+    echo -e "${GREEN}服务监听地址: http://0.0.0.0:${LISTEN_PORT}${PLAIN}"
     echo -e "${GREEN}控制台日志已重定向至: ${INSTALL_DIR}/output.log${PLAIN}"
 }
 
@@ -157,47 +251,17 @@ install_app() {
     tar -xzf "$temp_tar" --overwrite
     rm -f "$temp_tar"
 
-    # ==================== 配置文件安全初始化 ====================
     local config_path="${INSTALL_DIR}/config.yaml"
-    local generated_pass=""
     if [ ! -f "$config_path" ]; then
         if [ -f "${INSTALL_DIR}/config.example.yaml" ]; then
-            echo -e "${BLUE}正在根据模板安全初始化并生成随机密钥...${PLAIN}"
-            cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
-            
-            local jwt_secret enc_key
-            if command -v openssl &>/dev/null; then
-                jwt_secret=$(openssl rand -hex 32)
-                enc_key=$(openssl rand -base64 32)
-            else
-                jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
-                enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
-            fi
-            generated_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-
-            safe_sed() {
-                sed -i "s|$1|$2|g" "$config_path"
-            }
-
-            safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
-            safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
-            safe_sed 'password: "replace-with-a-strong-password"' "password: \"${generated_pass}\""
+            interactive_configure "$config_path"
         else
             touch "$config_path"
             echo -e "${YELLOW}警告：未能在包中找到 config.example.yaml 模板，已生成空白 config.yaml。${PLAIN}"
         fi
     fi
-    # ============================================================
     
     echo -e "${GREEN}程序安装完成！${PLAIN}"
-    if [ -n "$generated_pass" ]; then
-        echo -e "${YELLOW}======================================================="
-        echo -e " 🎉 初始管理员安全凭证已成功写入 config.yaml！"
-        echo -e " 初始账户: admin"
-        echo -e " 初始密码: ${generated_pass}"
-        echo -e " 请妥善保存以上账号密码！"
-        echo -e "=======================================================${PLAIN}"
-    fi
     start_service
 }
 

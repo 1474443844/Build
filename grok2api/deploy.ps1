@@ -21,6 +21,18 @@ function Get-InstallDir {
     return $DefaultInstallDir
 }
 
+function Get-CurrentPort {
+    $configPath = "$InstallDir\config.yaml"
+    $parsedPort = "8000"
+    if (Test-Path $configPath) {
+        $listenLine = Get-Content $configPath | Where-Object { $_ -match "listen:" } | Select-Object -First 1
+        if ($listenLine -and $listenLine -match '(\d+)') {
+            $parsedPort = $Matches[1]
+        }
+    }
+    return $parsedPort
+}
+
 function Get-LatestRelease {
     Write-Host "正在从 1474443844/Build 检索最新的 grok2api 构建版本..." -ForegroundColor Cyan
     
@@ -52,6 +64,107 @@ function Get-LatestRelease {
     return @{ Tag = $targetRelease.tag_name; Url = $asset.browser_download_url }
 }
 
+function Interactive-Configure {
+    param (
+        [string]$configPath
+    )
+    Write-Host "=== Grok2API 交互式配置助手 ===" -ForegroundColor Cyan
+
+    # 1. 端口
+    $port = Read-Host "请输入服务监听端口 [默认: 8000]"
+    if (-not $port) { $port = "8000" }
+
+    # 2. 用户
+    $adminUser = Read-Host "请输入管理员用户名 [默认: admin]"
+    if (-not $adminUser) { $adminUser = "admin" }
+
+    # 3. 密码
+    $adminPass = Read-Host "请输入管理员初始密码 [直接回车将自动生成随机强密码]"
+    $isRandom = $false
+    if (-not $adminPass) {
+        $isRandom = $true
+        $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        $random = New-Object Byte[] 16
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($random)
+        $adminPass = ""
+        foreach ($b in $random) {
+            $adminPass += $chars[$b % $chars.Length]
+        }
+    }
+
+    # 4. 存储
+    Write-Host "`n请选择数据库存储驱动类型：" -ForegroundColor Gray
+    Write-Host "  1. SQLite (单实例极速部署推荐)" -ForegroundColor Gray
+    Write-Host "  2. PostgreSQL (多实例负载高可用推荐)" -ForegroundColor Gray
+    $dbChoice = Read-Host "请选择 [1-2, 默认: 1]"
+    $dbDriver = "sqlite"
+    $pgDsn = "postgres://user:password@127.0.0.1:5432/grok2api?sslmode=disable"
+    if ($dbChoice -eq "2") {
+        $dbDriver = "postgres"
+        $inputDsn = Read-Host "请输入 PostgreSQL DSN 连接串 [默认: $pgDsn]"
+        if ($inputDsn) { $pgDsn = $inputDsn }
+    }
+
+    # 5. 缓存驱动
+    Write-Host "`n请选择运行缓存驱动类型：" -ForegroundColor Gray
+    Write-Host "  1. Memory (单机轻量)" -ForegroundColor Gray
+    Write-Host "  2. Redis (多实例高可用集群推荐)" -ForegroundColor Gray
+    $storeChoice = Read-Host "请选择 [1-2, 默认: 1]"
+    $storeDriver = "memory"
+    $redisAddr = "127.0.0.1:6379"
+    $redisPass = ""
+    if ($storeChoice -eq "2") {
+        $storeDriver = "redis"
+        $inputRedisAddr = Read-Host "请输入 Redis 连接地址 [默认: $redisAddr]"
+        if ($inputRedisAddr) { $redisAddr = $inputRedisAddr }
+        $inputRedisPass = Read-Host "请输入 Redis 访问密码 [默认: 无]"
+        if ($inputRedisPass) { $redisPass = $inputRedisPass }
+    }
+
+    # 6. 生成安全随机密钥
+    $bytes = New-Object Byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $JwtSecret = [System.BitConverter]::ToString($bytes).Replace("-", "").ToLower()
+    
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $EncKey = [System.Convert]::ToBase64String($bytes)
+
+    Copy-Item -Path "$InstallDir\config.example.yaml" -Destination $configPath -Force
+    $content = Get-Content -Path $configPath -Raw
+
+    # 正则安全替换
+    $content = $content -replace 'listen: "127.0.0.1:8000"', "listen: `"0.0.0.0:$port`""
+    $content = $content -replace 'jwtSecret: "replace-with-at-least-32-characters"', "jwtSecret: `"$JwtSecret`""
+    $content = $content -replace 'credentialEncryptionKey: "replace-with-base64-key"', "credentialEncryptionKey: `"$EncKey`""
+    $content = $content -replace 'username: "admin"', "username: `"$adminUser`""
+    $content = $content -replace 'password: "replace-with-a-strong-password"', "password: `"$adminPass`""
+    
+    $content = $content -replace 'driver: sqlite # sqlite \| postgres', "driver: $dbDriver # sqlite | postgres"
+    if ($dbDriver -eq "postgres") {
+        $content = $content -replace 'postgres://user:password@127.0.0.1:5432/grok2api\?sslmode=disable', $pgDsn
+    }
+
+    $content = $content -replace 'driver: memory # memory \| redis', "driver: $storeDriver # memory | redis"
+    if ($storeDriver -eq "redis") {
+        $content = $content -replace 'address: "127.0.0.1:6379"', "address: `"$redisAddr`""
+        $content = $content -replace 'password: ""', "password: `"$redisPass`""
+    }
+
+    Set-Content -Path $configPath -Value $content -Force
+
+    Write-Host "🎉 config.yaml 交互配置写入完成！" -ForegroundColor Green
+    Write-Host "=======================================================" -ForegroundColor Yellow
+    Write-Host " 🚀 初始管理员安全凭证已成功配置：" -ForegroundColor Yellow
+    Write-Host " 初始账户: $adminUser" -ForegroundColor Yellow
+    Write-Host " 初始密码: $adminPass" -ForegroundColor Yellow
+    if ($isRandom) {
+        Write-Host " (提示: 这是系统为您随机生成的强密码，请妥善保存！)" -ForegroundColor Yellow
+    }
+    Write-Host "=======================================================" -ForegroundColor Yellow
+
+    $global:ListenPort = $port
+}
+
 function Install-App {
     $InstallDir = Get-InstallDir
     
@@ -71,59 +184,26 @@ function Install-App {
     Expand-Archive -Path $zipPath -DestinationPath $InstallDir -Force
     Remove-Item $zipPath -Force
 
-    # ==================== 配置文件安全初始化 ====================
     $configPath = "$InstallDir\config.yaml"
-    $AdminPass = ""
     if (-not (Test-Path $configPath)) {
         if (Test-Path "$InstallDir\config.example.yaml") {
-            Write-Host "正在从模板安全初始化并生成随机密钥..." -ForegroundColor Cyan
-            Copy-Item -Path "$InstallDir\config.example.yaml" -Destination $configPath -Force
-            
-            $bytes = New-Object Byte[] 32
-            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-            $JwtSecret = [System.BitConverter]::ToString($bytes).Replace("-", "").ToLower()
-            
-            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-            $EncKey = [System.Convert]::ToBase64String($bytes)
-            
-            $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            $random = New-Object Byte[] 16
-            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($random)
-            foreach ($b in $random) {
-                $AdminPass += $chars[$b % $chars.Length]
-            }
-            
-            $content = Get-Content -Path $configPath -Raw
-            $content = $content -replace 'jwtSecret: "replace-with-at-least-32-characters"', "jwtSecret: `"$JwtSecret`""
-            $content = $content -replace 'credentialEncryptionKey: "replace-with-base64-key"', "credentialEncryptionKey: `"$EncKey`""
-            $content = $content -replace 'password: "replace-with-a-strong-password"', "password: `"$AdminPass`""
-            Set-Content -Path $configPath -Value $content -Force
+            Interactive-Configure $configPath
         } else {
             New-Item -ItemType File -Path $configPath -Force | Out-Null
             Write-Host "警告：未能在包中找到 config.example.yaml 模板，已生成空白 config.yaml。" -ForegroundColor Yellow
         }
+    } else {
+        $global:ListenPort = Get-CurrentPort
     }
-    # ============================================================
-
-    $port = Read-Host "请输入监听端口 [默认: 8000]"
-    if (-not $port) { $port = "8000" }
 
     Write-Host "正在创建 Windows 计划任务实现开机自启后台运行..." -ForegroundColor Cyan
-    $action = New-ScheduledTaskAction -Execute "$InstallDir\grok2api.exe" -Argument "--config `"$configPath`" --listen 0.0.0.0:$port" -WorkingDirectory $InstallDir
+    $action = New-ScheduledTaskAction -Execute "$InstallDir\grok2api.exe" -Argument "--config `"$configPath`"" -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "`n安装完成！服务已在后台运行。" -ForegroundColor Green
-    if ($AdminPass) {
-        Write-Host "=======================================================" -ForegroundColor Yellow
-        Write-Host " 🎉 初始管理员安全凭证已成功写入 config.yaml！" -ForegroundColor Yellow
-        Write-Host " 初始账户: admin" -ForegroundColor Yellow
-        Write-Host " 初始密码: $AdminPass" -ForegroundColor Yellow
-        Write-Host " 请妥善保存以上账号密码！" -ForegroundColor Yellow
-        Write-Host "=======================================================" -ForegroundColor Yellow
-    }
     Pause
 }
 

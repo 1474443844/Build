@@ -79,6 +79,97 @@ fetch_latest_release() {
     fi
 }
 
+interactive_configure() {
+    local config_path="$1"
+    echo -e "\n${BLUE}=================== Grok2API 交互式配置助手 ===================${PLAIN}"
+
+    # 1. 端口
+    read -p "请输入服务运行端口 [默认: 8000]: " input_port < /dev/tty
+    local port=${input_port:-"8000"}
+
+    # 2. 管理员
+    read -p "请输入管理员用户名 [默认: admin]: " admin_user < /dev/tty
+    admin_user=${admin_user:-"admin"}
+
+    # 3. 密码
+    read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
+    local is_random=false
+    if [ -z "$admin_pass" ]; then
+        admin_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+        is_random=true
+    fi
+
+    # 4. 数据库
+    echo -e "\n请选择数据库存储驱动类型："
+    echo -e "  1. SQLite (推荐)"
+    echo -e "  2. PostgreSQL"
+    read -p "请选择驱动 [1-2, 默认: 1]: " db_choice < /dev/tty
+    local db_driver="sqlite"
+    local pg_dsn="postgres://user:password@127.0.0.1:5432/grok2api?sslmode=disable"
+    if [ "$db_choice" = "2" ]; then
+        db_driver="postgres"
+        read -p "请输入 PostgreSQL DSN 连接串: " input_dsn < /dev/tty
+        pg_dsn=${input_dsn:-"$pg_dsn"}
+    fi
+
+    # 5. 运行存储
+    echo -e "\n请选择缓存驱动类型："
+    echo -e "  1. Memory (单机极速)"
+    echo -e "  2. Redis (高可用集群)"
+    read -p "请选择驱动 [1-2, 默认: 1]: " store_choice < /dev/tty
+    local store_driver="memory"
+    local redis_addr="127.0.0.1:6379"
+    local redis_pass=""
+    if [ "$store_choice" = "2" ]; then
+        store_driver="redis"
+        read -p "请输入 Redis 地址 [默认: $redis_addr]: " input_redis_addr < /dev/tty
+        redis_addr=${input_redis_addr:-"$redis_addr"}
+        read -p "请输入 Redis 密码 [默认: 无]: " input_redis_pass < /dev/tty
+        redis_pass=${input_redis_pass:-""}
+    fi
+
+    # 6. 安全密钥
+    local jwt_secret enc_key
+    if command -v openssl &>/dev/null; then
+        jwt_secret=$(openssl rand -hex 32)
+        enc_key=$(openssl rand -base64 32)
+    else
+        jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
+        enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
+    fi
+
+    cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
+
+    safe_sed() {
+        sed -i "" "s|$1|$2|g" "$config_path"
+    }
+
+    safe_sed 'listen: "127.0.0.1:8000"' "listen: \"0.0.0.0:${port}\""
+    safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
+    safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
+    safe_sed 'username: "admin"' "username: \"${admin_user}\""
+    safe_sed 'password: "replace-with-a-strong-password"' "password: \"${admin_pass}\""
+    
+    safe_sed 'driver: sqlite # sqlite | postgres' "driver: ${db_driver} # sqlite \| postgres"
+    if [ "$db_driver" = "postgres" ]; then
+        safe_sed 'dsn: "postgres://user:password@127.0.0.1:5432/grok2api.*"' "dsn: \"${pg_dsn}\""
+    fi
+
+    safe_sed 'driver: memory # memory | redis' "driver: ${store_driver} # memory \| redis"
+    if [ "$store_driver" = "redis" ]; then
+        safe_sed 'address: "127.0.0.1:6379"' "address: \"${redis_addr}\""
+        safe_sed 'password: ""' "password: \"${redis_pass}\""
+    fi
+
+    echo -e "${GREEN}🎉 config.yaml 写入成功！${PLAIN}"
+    echo -e "${YELLOW}======================================================="
+    echo -e " 🚀 初始管理员凭证已写入配置文件："
+    echo -e " 初始账户: ${admin_user}"
+    echo -e " 初始密码: ${admin_pass}"
+    [ "$is_random" = "true" ] && echo -e " (提示: 这是随机密码，请尽快登录并保存！)"
+    echo -e "=======================================================${PLAIN}"
+}
+
 install_app() {
     detect_arch
     get_current_install_dir
@@ -96,40 +187,15 @@ install_app() {
     tar -xzf "$temp_tar" --overwrite
     rm -f "$temp_tar"
 
-    # ==================== 配置文件安全初始化 ====================
     local config_path="${INSTALL_DIR}/config.yaml"
-    local generated_pass=""
     if [ ! -f "$config_path" ]; then
         if [ -f "${INSTALL_DIR}/config.example.yaml" ]; then
-            echo -e "${BLUE}正在根据模板安全初始化并生成随机密钥...${PLAIN}"
-            cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
-            
-            local jwt_secret enc_key
-            if command -v openssl &>/dev/null; then
-                jwt_secret=$(openssl rand -hex 32)
-                enc_key=$(openssl rand -base64 32)
-            else
-                jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
-                enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
-            fi
-            generated_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-
-            safe_sed() {
-                sed -i "" "s|$1|$2|g" "$config_path"
-            }
-
-            safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
-            safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
-            safe_sed 'password: "replace-with-a-strong-password"' "password: \"${generated_pass}\""
+            interactive_configure "$config_path"
         else
             touch "$config_path"
             echo -e "${YELLOW}警告：未能在包中找到 config.example.yaml 模板，已生成空白 config.yaml。${PLAIN}"
         fi
     fi
-    # ============================================================
-
-    read -p "请输入服务监听端口 [默认: 8000]: " listen_port < /dev/tty
-    listen_port=${listen_port:-"8000"}
 
     launchctl unload "$PLIST_FILE" &> /dev/null
 
@@ -145,8 +211,6 @@ install_app() {
         <string>${INSTALL_DIR}/grok2api</string>
         <string>--config</string>
         <string>${config_path}</string>
-        <string>--listen</string>
-        <string>0.0.0.0:${listen_port}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${INSTALL_DIR}</string>
@@ -163,15 +227,7 @@ install_app() {
 EOF
 
     launchctl load -w "$PLIST_FILE"
-    echo -e "${GREEN}安装成功并已启动守护进程！${PLAIN}"
-    if [ -n "$generated_pass" ]; then
-        echo -e "${YELLOW}======================================================="
-        echo -e " 🎉 初始管理员安全凭证已成功写入 config.yaml！"
-        echo -e " 初始账户: admin"
-        echo -e " 初始密码: ${generated_pass}"
-        echo -e " 请妥善保存以上账号密码！"
-        echo -e "=======================================================${PLAIN}"
-    fi
+    echo -e "${GREEN}服务配置已重载并已拉起！${PLAIN}"
 }
 
 update_app() {
