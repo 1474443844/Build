@@ -32,9 +32,8 @@ on:
 
 # 在全局或各步骤中内置仓库名称
 env:
-  # 【内置仓库链接】默认拉取当前工作流所在的仓库。
   # 如果要锁死为其他外部 GitHub 仓库，请直接修改此处的值（例如：TARGET_REPO: 'owner/other-repo'）
-  TARGET_REPO: 'https://github.com/chenyme/grok2api'
+  TARGET_REPO: 'chenyme/grok2api'
 
 jobs:
   # 阶段 1：解析用户勾选的平台，动态生成构建矩阵
