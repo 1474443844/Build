@@ -115,7 +115,7 @@ jobs:
           pnpm build
 
       - name: Upload frontend assets
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: frontend/dist
@@ -141,7 +141,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Download frontend assets
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: temp-dist
@@ -171,7 +171,7 @@ jobs:
           fi
 
       - name: Upload packaged binaries
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: grok2api-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -193,7 +193,7 @@ jobs:
           ref: ${{ inputs.branch }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           path: all-artifacts
 
@@ -204,7 +204,7 @@ jobs:
           find all-artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-files/*
           tag_name: "grok2api-${{ inputs.branch }}"
