@@ -242,6 +242,7 @@ install_app() {
 
     local temp_tar="grok2api_android.tar.gz"
     echo -e "${BLUE}正在下载安卓包 (${LATEST_TAG})...${PLAIN}"
+    echo -e "${DOWNLOAD_URL}"
     if ! curl -L -o "$temp_tar" "$DOWNLOAD_URL"; then
         echo -e "${RED}下载失败，请检查网络。${PLAIN}"
         exit 1
