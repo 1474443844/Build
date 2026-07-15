@@ -13,7 +13,7 @@ on:
         type: boolean
         default: true
       windows:
-        description: '编译 Windows 平台 (包含 amd64)'
+        description: '编译 Windows 平台 (包含 amd64, arm64)'
         type: boolean
         default: true
       mac:
@@ -21,7 +21,7 @@ on:
         type: boolean
         default: true
       android:
-        description: '编译 Android 平台 (包含 arm64, amd64)'
+        description: '编译 Android 平台 (包含 arm64)'
         type: boolean
         default: false
       # 是否自动创建 Release
@@ -62,6 +62,7 @@ jobs:
           
           if [ "${{ inputs.windows }}" = "true" ]; then
             append_to_matrix "windows" "amd64" ".exe"
+            append_to_matrix "windows" "arm64" ".exe"
           fi
           
           if [ "${{ inputs.mac }}" = "true" ]; then
@@ -71,7 +72,6 @@ jobs:
           
           if [ "${{ inputs.android }}" = "true" ]; then
             append_to_matrix "android" "arm64" ""
-            append_to_matrix "android" "amd64" ""
           fi
           
           if [ "$(echo "$MATRIX_JSON" | jq 'length')" -eq 0 ]; then
