@@ -4,6 +4,9 @@
 # Grok2API 一键部署与更新脚本 (Android / Termux & 自定义 PTY 通用 - 1474443844/Build)
 # ==============================================================================
 
+# 解决 curl -fsSL ... | bash 管道执行导致输入流被占用、read 无法等待输入而无限循环的问题
+exec </dev/tty 2>/dev/null || true
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -33,7 +36,6 @@ else
 fi
 
 get_default_dir() {
-    # 优先从缓存文件中读取曾设定过的自定义路径
     if [ -f "$PATH_CACHE_FILE" ]; then
         DEFAULT_DIR=$(cat "$PATH_CACHE_FILE")
     else
@@ -50,7 +52,6 @@ get_default_dir() {
 }
 
 save_dir_to_cache() {
-    # 保存当前的自定义位置到缓存，以便升级、启停时自动获取
     echo "$INSTALL_DIR" > "$PATH_CACHE_FILE"
 }
 
@@ -114,7 +115,6 @@ stop_service() {
 install_app() {
     get_default_dir
     
-    # 提示并支持用户自定义安装路径
     read -p "请输入自定义安装目录 [当前/默认: ${DEFAULT_DIR}]: " custom_dir
     INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
     save_dir_to_cache
@@ -147,7 +147,6 @@ install_app() {
 update_app() {
     get_default_dir
     
-    # 调取并提示用户确认之前的自定义目录
     read -p "请确认当前运行程序的安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir
     INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
     save_dir_to_cache
