@@ -122,7 +122,7 @@ interactive_configure() {
     read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
     local is_random=false
     if [ -z "$admin_pass" ]; then
-        admin_pass=$(openssl rand -hex 32)
+        admin_pass=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
         is_random=true
     fi
 
@@ -156,8 +156,8 @@ interactive_configure() {
     fi
 
     local jwt_secret enc_key
-    jwt_secret=$(openssl rand -hex 32)
-    enc_key=$(openssl rand -base64 32)
+    jwt_secret=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+    enc_key=$(head -c 32 /dev/urandom | base64)
 
     cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
 
