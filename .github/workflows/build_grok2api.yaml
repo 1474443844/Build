@@ -1,0 +1,224 @@
+name: Build and Package grok2api Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要切换的分支、标签或 Commit SHA'
+        required: true
+        default: 'main'
+      # 平台多选（在 UI 中显示为复选框）
+      linux:
+        description: '编译 Linux 平台 (包含 amd64, arm64)'
+        type: boolean
+        default: true
+      windows:
+        description: '编译 Windows 平台 (包含 amd64)'
+        type: boolean
+        default: true
+      mac:
+        description: '编译 macOS 平台 (包含 Intel amd64, Apple M系列 arm64)'
+        type: boolean
+        default: true
+      android:
+        description: '编译 Android 平台 (包含 arm64, amd64)'
+        type: boolean
+        default: false
+      # 是否自动创建 Release
+      create_release:
+        description: '编译完成后是否自动创建 GitHub Release'
+        type: boolean
+        default: false
+
+# 在全局或各步骤中内置仓库名称
+env:
+  # 【内置仓库链接】默认拉取当前工作流所在的仓库。
+  # 如果要锁死为其他外部 GitHub 仓库，请直接修改此处的值（例如：TARGET_REPO: 'owner/other-repo'）
+  TARGET_REPO: 'https://github.com/chenyme/grok2api'
+
+jobs:
+  # 阶段 1：解析用户勾选的平台，动态生成构建矩阵
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Generate matrix
+        id: set-matrix
+        run: |
+          MATRIX_JSON="[]"
+          
+          # 辅助函数：向矩阵 JSON 数组中追加平台配置
+          append_to_matrix() {
+            local os=$1
+            local arch=$2
+            local suffix=$3
+            MATRIX_JSON=$(echo "$MATRIX_JSON" | jq --arg os "$os" --arg arch "$arch" --arg suffix "$suffix" '. += [{"goos": $os, "goarch": $arch, "suffix": $suffix}]')
+          }
+          
+          if [ "${{ inputs.linux }}" = "true" ]; then
+            append_to_matrix "linux" "amd64" ""
+            append_to_matrix "linux" "arm64" ""
+          fi
+          
+          if [ "${{ inputs.windows }}" = "true" ]; then
+            append_to_matrix "windows" "amd64" ".exe"
+          fi
+          
+          if [ "${{ inputs.mac }}" = "true" ]; then
+            append_to_matrix "darwin" "amd64" ""
+            append_to_matrix "darwin" "arm64" ""
+          fi
+          
+          if [ "${{ inputs.android }}" = "true" ]; then
+            append_to_matrix "android" "arm64" ""
+            append_to_matrix "android" "amd64" ""
+          fi
+          
+          if [ "$(echo "$MATRIX_JSON" | jq 'length')" -eq 0 ]; then
+            echo "错误：未选择任何平台！请至少选择一个编译平台。" >&2
+            exit 1
+          fi
+          
+          echo "matrix=$(echo "$MATRIX_JSON" | jq -c .)" >> $GITHUB_OUTPUT
+
+  # 阶段 2：构建前端静态资源
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          pnpm build
+
+      - name: Upload frontend assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  # 阶段 3：多平台动态编译 Go 后端并打包
+  build-backend:
+    needs: [setup-matrix, build-frontend]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: backend/go.sum
+
+      - name: Download frontend assets
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: temp-dist
+
+      - name: Build Go Backend
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          cd backend
+          go build -buildvcs=false -trimpath -ldflags="-s -w" -o ../grok2api${{ matrix.suffix }} ./cmd/grok2api
+
+      - name: Package Release Archive
+        shell: bash
+        run: |
+          mkdir -p release-pkg/frontend
+          mv temp-dist release-pkg/frontend/dist
+          mv grok2api${{ matrix.suffix }} release-pkg/
+          
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cd release-pkg
+            zip -r ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.zip .
+          else
+            cd release-pkg
+            tar -czf ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz .
+          fi
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok2api-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            grok2api-*.zip
+            grok2api-*.tar.gz
+          retention-days: 7
+
+  # 阶段 4：自动创建 Release（若勾选）
+  create-release:
+    needs: [setup-matrix, build-backend]
+    if: ${{ inputs.create_release == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          ref: ${{ inputs.branch }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Flatten directory structure
+        run: |
+          mkdir -p release-files
+          find all-artifacts -name "*.zip" -exec cp {} release-files/ \;
+          find all-artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          tag_name: ${{ inputs.branch }}
+          name: "Release ${{ inputs.branch }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
