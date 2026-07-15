@@ -161,6 +161,7 @@ jobs:
           mkdir -p release-pkg/frontend
           mv temp-dist release-pkg/frontend/dist
           mv grok2api${{ matrix.suffix }} release-pkg/
+          cp config.example.yaml release-pkg/config.example.yaml
           
           cd release-pkg
           if [ "${{ matrix.goos }}" = "windows" ]; then

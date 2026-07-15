@@ -29,18 +29,15 @@ function Get-LatestRelease {
     
     while ($true) {
         Write-Host "正在检索 releases 列表第 $page 页..." -ForegroundColor Gray
-        # 设定 per_page=100 并结合递增 $page 进行循环抓取，直到找到或检索完毕为止
         $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100&page=$page"
         
-        # 如果获取数据为空，说明已经遍历完所有 Release 仍没有结果
         if (-not $releases -or $releases.Count -eq 0) {
             break
         }
         
-        # 精准匹配第一个以 grok2api- 开头的版本
         $targetRelease = $releases | Where-Object { $_.tag_name -like "grok2api-*" } | Select-Object -First 1
         if ($targetRelease) {
-            break # 找到了，跳出循环
+            break
         }
         
         $page++
@@ -74,11 +71,39 @@ function Install-App {
     Expand-Archive -Path $zipPath -DestinationPath $InstallDir -Force
     Remove-Item $zipPath -Force
 
+    # ==================== 配置文件安全初始化 ====================
     $configPath = "$InstallDir\config.yaml"
+    $AdminPass = ""
     if (-not (Test-Path $configPath)) {
-        New-Item -ItemType File -Path $configPath -Force | Out-Null
-        Write-Host "已自动创建空白 config.yaml，请后续进行修改。" -ForegroundColor Yellow
+        if (Test-Path "$InstallDir\config.example.yaml") {
+            Write-Host "正在从模板安全初始化并生成随机密钥..." -ForegroundColor Cyan
+            Copy-Item -Path "$InstallDir\config.example.yaml" -Destination $configPath -Force
+            
+            $bytes = New-Object Byte[] 32
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            $JwtSecret = [System.BitConverter]::ToString($bytes).Replace("-", "").ToLower()
+            
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            $EncKey = [System.Convert]::ToBase64String($bytes)
+            
+            $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            $random = New-Object Byte[] 16
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($random)
+            foreach ($b in $random) {
+                $AdminPass += $chars[$b % $chars.Length]
+            }
+            
+            $content = Get-Content -Path $configPath -Raw
+            $content = $content -replace 'jwtSecret: "replace-with-at-least-32-characters"', "jwtSecret: `"$JwtSecret`""
+            $content = $content -replace 'credentialEncryptionKey: "replace-with-base64-key"', "credentialEncryptionKey: `"$EncKey`""
+            $content = $content -replace 'password: "replace-with-a-strong-password"', "password: `"$AdminPass`""
+            Set-Content -Path $configPath -Value $content -Force
+        } else {
+            New-Item -ItemType File -Path $configPath -Force | Out-Null
+            Write-Host "警告：未能在包中找到 config.example.yaml 模板，已生成空白 config.yaml。" -ForegroundColor Yellow
+        }
     }
+    # ============================================================
 
     $port = Read-Host "请输入监听端口 [默认: 8000]"
     if (-not $port) { $port = "8000" }
@@ -91,6 +116,14 @@ function Install-App {
 
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "`n安装完成！服务已在后台运行。" -ForegroundColor Green
+    if ($AdminPass) {
+        Write-Host "=======================================================" -ForegroundColor Yellow
+        Write-Host " 🎉 初始管理员安全凭证已成功写入 config.yaml！" -ForegroundColor Yellow
+        Write-Host " 初始账户: admin" -ForegroundColor Yellow
+        Write-Host " 初始密码: $AdminPass" -ForegroundColor Yellow
+        Write-Host " 请妥善保存以上账号密码！" -ForegroundColor Yellow
+        Write-Host "=======================================================" -ForegroundColor Yellow
+    }
     Pause
 }
 

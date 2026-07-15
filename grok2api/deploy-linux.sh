@@ -82,7 +82,6 @@ fetch_latest_release() {
 
     echo -e "${GREEN}已成功匹配到最新 grok2api 版本: ${LATEST_TAG}${PLAIN}"
 
-    # 定向拉取该指定 Tag 的特定平台资源包
     local tag_json
     tag_json=$(curl -s "https://api.github.com/repos/${REPO}/releases/tags/${LATEST_TAG}")
     DOWNLOAD_URL=$(echo "$tag_json" | grep "browser_download_url" | grep "$PLATFORM" | head -n 1 | cut -d '"' -f 4)
@@ -173,11 +172,41 @@ install_app() {
     tar -xzf "$temp_tar" --overwrite
     rm -f "$temp_tar"
 
+    # ==================== 配置文件安全初始化 ====================
     local config_path="${INSTALL_DIR}/config.yaml"
+    local generated_pass=""
     if [ ! -f "$config_path" ]; then
-        touch "$config_path"
-        echo -e "${YELLOW}提示：已在路径下生成空白的 config.yaml，请记得编辑。${PLAIN}"
+        if [ -f "${INSTALL_DIR}/config.example.yaml" ]; then
+            echo -e "${BLUE}正在根据模板安全初始化并生成随机密钥...${PLAIN}"
+            cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
+            
+            local jwt_secret enc_key
+            if command -v openssl &>/dev/null; then
+                jwt_secret=$(openssl rand -hex 32)
+                enc_key=$(openssl rand -base64 32)
+            else
+                jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
+                enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
+            fi
+            generated_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+
+            safe_sed() {
+                if [ "$(uname)" = "Darwin" ]; then
+                    sed -i "" "s|$1|$2|g" "$config_path"
+                else
+                    sed -i "s|$1|$2|g" "$config_path"
+                fi
+            }
+
+            safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
+            safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
+            safe_sed 'password: "replace-with-a-strong-password"' "password: \"${generated_pass}\""
+        else
+            touch "$config_path"
+            echo -e "${YELLOW}警告：未能在包中找到 config.example.yaml 模板，已生成空白 config.yaml。${PLAIN}"
+        fi
     fi
+    # ============================================================
 
     local current_port="8000"
     if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
@@ -207,7 +236,15 @@ EOF
     systemctl enable "$SERVICE_NAME"
     systemctl restart "$SERVICE_NAME"
 
-    echo -e "${GREEN}程序安装完成！${PLAIN}"
+    echo -e "${GREEN}程序安装完成并已启动！${PLAIN}"
+    if [ -n "$generated_pass" ]; then
+        echo -e "${YELLOW}======================================================="
+        echo -e " 🎉 初始管理员安全凭证已成功写入 config.yaml！"
+        echo -e " 初始账户: admin"
+        echo -e " 初始密码: ${generated_pass}"
+        echo -e " 请妥善保存以上账号密码！"
+        echo -e "=======================================================${PLAIN}"
+    fi
 
     read -p "是否需要自动配置 Nginx 反向代理？ [y/N]: " setup_nginx < /dev/tty
     if [[ "$setup_nginx" =~ ^[Yy]$ ]]; then
