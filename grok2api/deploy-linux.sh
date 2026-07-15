@@ -153,7 +153,7 @@ interactive_configure() {
     # 6. 生成安全随机密钥对 (调大至 2048 字节，消除 broken pipe 并保障长度)
     local jwt_secret enc_key
     jwt_secret=$(openssl rand -hex 32)
-    enc_key=$(openssl -base64 32)
+    enc_key=$(openssl rand -base64 32)
 
     cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
 
