@@ -113,11 +113,11 @@ interactive_configure() {
     read -p "请输入管理员用户名 [默认: admin]: " admin_user < /dev/tty
     admin_user=${admin_user:-"admin"}
 
-    # 3. 管理员密码 (解决 broken pipe)
+    # 3. 管理员密码 (调大至 512 字节，消除 broken pipe 警告)
     read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
     local is_random=false
     if [ -z "$admin_pass" ]; then
-        admin_pass=$(head -c 128 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16 2>/dev/null)
+        admin_pass=$(head -c 512 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16 2>/dev/null)
         is_random=true
     fi
 
@@ -150,10 +150,10 @@ interactive_configure() {
         redis_pass=${input_redis_pass:-""}
     fi
 
-    # 6. 生成安全随机密钥对 (消除 broken pipe)
+    # 6. 生成安全随机密钥对 (调大至 2048 字节，消除 broken pipe 并保障长度)
     local jwt_secret enc_key
-    jwt_secret=$(head -c 128 /dev/urandom | tr -dc 'a-f0-9' | head -c 64 2>/dev/null)
-    enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
+    jwt_secret=$(openssl rand -hex 32)
+    enc_key=$(openssl -base64 32)
 
     cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
 
@@ -161,7 +161,7 @@ interactive_configure() {
         sed -i "s|$1|$2|g" "$config_path"
     }
 
-    # 执行文本替换 (匹配不包含特殊字符的独立主键，避开注释中的管道符错误)
+    # 执行文本替换
     safe_sed 'listen: "127.0.0.1:8000"' "listen: \"0.0.0.0:${port}\""
     safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
     safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
@@ -255,7 +255,6 @@ install_app() {
     INSTALL_DIR=${custom_dir:-"$INSTALL_DIR"}
 
     fetch_latest_release
-
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR" || exit 1
 
