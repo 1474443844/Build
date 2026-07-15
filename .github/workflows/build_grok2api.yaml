@@ -1,13 +1,13 @@
-name: Build and Package grok2api Binaries
+name: Build and Release grok2api
 
+# 仅支持手动触发
 on:
   workflow_dispatch:
     inputs:
       branch:
         description: '要切换的分支、标签或 Commit SHA'
         required: true
-        default: 'main'
-      # 平台多选（在 UI 中显示为复选框）
+        default: 'v'
       linux:
         description: '编译 Linux 平台 (包含 amd64, arm64)'
         type: boolean
@@ -21,7 +21,7 @@ on:
         type: boolean
         default: true
       android:
-        description: '编译 Android 平台 (包含 arm64)'
+        description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
         type: boolean
         default: false
       # 是否自动创建 Release
@@ -30,9 +30,8 @@ on:
         type: boolean
         default: false
 
-# 在全局或各步骤中内置仓库名称
+# 在全局内置仓库名称
 env:
-  # 如果要锁死为其他外部 GitHub 仓库，请直接修改此处的值（例如：TARGET_REPO: 'owner/other-repo'）
   TARGET_REPO: 'chenyme/grok2api'
 
 jobs:
@@ -47,7 +46,6 @@ jobs:
         run: |
           MATRIX_JSON="[]"
           
-          # 辅助函数：向矩阵 JSON 数组中追加平台配置
           append_to_matrix() {
             local os=$1
             local arch=$2
@@ -88,7 +86,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Setup Node.js
@@ -140,7 +138,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Setup Go
@@ -171,12 +169,12 @@ jobs:
           mv temp-dist release-pkg/frontend/dist
           mv grok2api${{ matrix.suffix }} release-pkg/
           
+          # 进入 release-pkg 目录，使用通配符 * 进行打包，彻底移除顶层 . 目录
+          cd release-pkg
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            cd release-pkg
-            zip -r ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.zip .
+            zip -r ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.zip *
           else
-            cd release-pkg
-            tar -czf ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz .
+            tar -czf ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz *
           fi
 
       - name: Upload packaged binaries
@@ -199,7 +197,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.TARGET_REPO }} # 使用内置的仓库链接
+          repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Download all artifacts
@@ -218,6 +216,6 @@ jobs:
         with:
           files: release-files/*
           tag_name: ${{ inputs.branch }}
-          name: "Release ${{ inputs.branch }}"
+          name: "grok2api - ${{ inputs.branch }}" # 将 release 标题与输入的分支/Tag 组合
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
