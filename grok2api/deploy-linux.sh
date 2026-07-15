@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Grok2API 交互式部署与更新脚本 (Linux - 1474443844/Build 专用)
+# ==============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;36m'
+PLAIN='\033[0m'
+
+REPO="1474443844/Build"
+DEFAULT_INSTALL_DIR="/opt/grok2api"
+SERVICE_NAME="grok2api"
+
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误：请使用 root 用户或通过 sudo 运行此脚本。${PLAIN}"
+    exit 1
+fi
+
+for cmd in curl tar grep sed; do
+    if ! command -v $cmd &> /dev/null; then
+        echo -e "${RED}错误：系统缺少必要工具 $cmd，请先安装。${PLAIN}"
+        exit 1
+    fi
+done
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    if [ "$arch" = "x86_64" ]; then
+        PLATFORM="linux-amd64"
+    elif [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+        PLATFORM="linux-arm64"
+    else
+        echo -e "${RED}错误：暂不支持的系统架构 ($arch)。${PLAIN}"
+        exit 1
+    fi
+}
+
+get_current_install_dir() {
+    local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
+    if [ -f "$service_path" ]; then
+        # 动态读取历史配置中的运行路径
+        CURRENT_DIR=$(grep "WorkingDirectory" "$service_path" | cut -d '=' -f 2 | tr -d ' ')
+    fi
+    INSTALL_DIR=${CURRENT_DIR:-"$DEFAULT_INSTALL_DIR"}
+}
+
+fetch_latest_release() {
+    echo -e "${BLUE}正在从 1474443844/Build 获取最新版本...${PLAIN}"
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    local release_json
+    release_json=$(curl -s "$api_url")
+    
+    if [ -z "$release_json" ] || echo "$release_json" | grep -q "message.*Not Found"; then
+        echo -e "${RED}错误：无法获取 GitHub Release 信息，请检查网络。${PLAIN}"
+        exit 1
+    fi
+
+    LATEST_TAG=$(echo "$release_json" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+    DOWNLOAD_URL=$(echo "$release_json" | grep "browser_download_url" | grep "$PLATFORM" | head -n 1 | cut -d '"' -f 4)
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo -e "${RED}错误：未能在最新 Release 中找到适用于 $PLATFORM 的构建包。${PLAIN}"
+        exit 1
+    fi
+}
+
+configure_nginx() {
+    local backend_port=$1
+    read -p "请输入您的解析域名 (例如 api.example.com 或 localhost): " domain_name
+    domain_name=${domain_name:-"localhost"}
+
+    echo -e "${BLUE}正在配置 Nginx 反向代理...${PLAIN}"
+    
+    local nginx_conf_dir=""
+    if [ -d "/etc/nginx/sites-available" ]; then
+        nginx_conf_dir="/etc/nginx/sites-available"
+    elif [ -d "/etc/nginx/conf.d" ]; then
+        nginx_conf_dir="/etc/nginx/conf.d"
+    else
+        echo -e "${YELLOW}警告：未检测到标准 Nginx 配置目录，将尝试创建 /etc/nginx/conf.d${PLAIN}"
+        mkdir -p /etc/nginx/conf.d
+        nginx_conf_dir="/etc/nginx/conf.d"
+    fi
+
+    local conf_file="${nginx_conf_dir}/grok2api.conf"
+    
+    cat > "$conf_file" <<EOF
+server {
+    listen 80;
+    server_name ${domain_name};
+
+    location / {
+        proxy_pass http://127.0.0.1:${backend_port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+
+    if [ "$nginx_conf_dir" = "/etc/nginx/sites-available" ]; then
+        mkdir -p /etc/nginx/sites-enabled
+        ln -sf "$conf_file" "/etc/nginx/sites-enabled/grok2api.conf"
+    fi
+
+    if command -v nginx &> /dev/null; then
+        if nginx -t &> /dev/null; then
+            systemctl reload nginx || systemctl restart nginx
+            echo -e "${GREEN}Nginx 反向代理配置成功，已自动重载！${PLAIN}"
+            echo -e "${GREEN}您现在可以通过 http://${domain_name} 访问该服务。${PLAIN}"
+        else
+            echo -e "${RED}错误：Nginx 配置文件验证失败，请手动修复：${conf_file}${PLAIN}"
+        fi
+    else
+        echo -e "${YELLOW}提示：Nginx 配置文件已保存在 ${conf_file}，但未检测到 Nginx 服务，请确保您已安装并启动 Nginx。${PLAIN}"
+    fi
+}
+
+install_app() {
+    detect_arch
+    get_current_install_dir
+
+    # 提示并支持自定义安装路径
+    read -p "请输入自定义安装目录 [当前/默认: ${INSTALL_DIR}]: " custom_dir
+    INSTALL_DIR=${custom_dir:-"$INSTALL_DIR"}
+
+    fetch_latest_release
+
+    mkdir -p "$INSTALL_DIR"
+    cd "$INSTALL_DIR" || exit 1
+
+    local temp_tar="grok2api_latest.tar.gz"
+    echo -e "${BLUE}正在下载构建包...${PLAIN}"
+    if ! curl -L -o "$temp_tar" "$DOWNLOAD_URL"; then
+        echo -e "${RED}下载失败，请检查网络。${PLAIN}"
+        exit 1
+    fi
+
+    echo -e "${BLUE}正在解压构建包...${PLAIN}"
+    tar -xzf "$temp_tar" --overwrite
+    rm -f "$temp_tar"
+
+    local config_path="${INSTALL_DIR}/config.yaml"
+    if [ ! -f "$config_path" ]; then
+        touch "$config_path"
+        echo -e "${YELLOW}提示：已在路径下生成空白的 config.yaml，请记得编辑。${PLAIN}"
+    fi
+
+    local current_port="8000"
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        current_port=$(grep "ExecStart" "/etc/systemd/system/${SERVICE_NAME}.service" | sed -E 's/.*--listen [^:]+:([0-9]+).*/\1/')
+    fi
+    read -p "请输入服务监听端口 [默认: ${current_port}]: " listen_port
+    listen_port=${listen_port:-"$current_port"}
+
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Grok2API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/grok2api --config ${config_path} --listen 0.0.0.0:${listen_port}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
+
+    echo -e "${GREEN}程序安装完成！${PLAIN}"
+
+    read -p "是否需要自动配置 Nginx 反向代理？ [y/N]: " setup_nginx
+    if [[ "$setup_nginx" =~ ^[Yy]$ ]]; then
+        configure_nginx "$listen_port"
+    fi
+}
+
+update_app() {
+    detect_arch
+    get_current_install_dir
+
+    if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        echo -e "${RED}错误：未检测到已安装服务，请选择安装。${PLAIN}"
+        return
+    fi
+
+    fetch_latest_release
+
+    if [ -f "${INSTALL_DIR}/grok2api" ]; then
+        cp "${INSTALL_DIR}/grok2api" "${INSTALL_DIR}/grok2api.bak"
+    fi
+
+    systemctl stop "$SERVICE_NAME"
+
+    cd "$INSTALL_DIR" || exit 1
+    local temp_tar="grok2api_update.tar.gz"
+    if curl -L -o "$temp_tar" "$DOWNLOAD_URL" && tar -xzf "$temp_tar" --overwrite; then
+        rm -f "$temp_tar"
+        rm -f "grok2api.bak"
+        systemctl start "$SERVICE_NAME"
+        echo -e "${GREEN}Grok2API 已成功更新至 ${LATEST_TAG} 并已启动！${PLAIN}"
+    else
+        echo -e "${RED}更新失败，正在恢复备份...${PLAIN}"
+        if [ -f "${INSTALL_DIR}/grok2api.bak" ]; then
+            mv "${INSTALL_DIR}/grok2api.bak" "${INSTALL_DIR}/grok2api"
+            systemctl start "$SERVICE_NAME"
+        fi
+        rm -f "$temp_tar"
+    fi
+}
+
+uninstall_app() {
+    get_current_install_dir
+    read -p "确定要彻底卸载吗？ [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        systemctl stop "$SERVICE_NAME" &> /dev/null
+        systemctl disable "$SERVICE_NAME" &> /dev/null
+        rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+        rm -f "/etc/nginx/sites-available/grok2api.conf"
+        rm -f "/etc/nginx/sites-enabled/grok2api.conf"
+        rm -f "/etc/nginx/conf.d/grok2api.conf"
+        systemctl daemon-reload
+        if command -v nginx &> /dev/null; then systemctl reload nginx &> /dev/null; fi
+
+        read -p "是否同时删除安装目录及数据 (${INSTALL_DIR})？ [y/N]: " delete_data
+        if [[ "$delete_data" =~ ^[Yy]$ ]]; then
+            rm -rf "$INSTALL_DIR"
+        fi
+        echo -e "${GREEN}卸载完成！${PLAIN}"
+    fi
+}
+
+manage_service() {
+    local action=$1
+    get_current_install_dir
+    if [ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        echo -e "${RED}错误：服务未安装。${PLAIN}"
+        return
+    fi
+    case $action in
+        start) systemctl start "$SERVICE_NAME" ;;
+        stop) systemctl stop "$SERVICE_NAME" ;;
+        restart) systemctl restart "$SERVICE_NAME" ;;
+        status) systemctl status "$SERVICE_NAME" ;;
+        logs) journalctl -u "$SERVICE_NAME" -n 50 -f ;;
+    esac
+}
+
+while true; do
+    echo -e "
+${BLUE}=========================================${PLAIN}
+${GREEN}       Grok2API 一键部署/管理 (Linux)     ${PLAIN}
+${BLUE}=========================================${PLAIN}
+  ${BLUE}1.${PLAIN} 安装 / 重新安装 Grok2API
+  ${BLUE}2.${PLAIN} 一键升级至最新版本 (保留配置)
+  ${BLUE}3.${PLAIN} 启动服务
+  ${BLUE}4.${PLAIN} 停止服务
+  ${BLUE}5.${PLAIN} 重启服务
+  ${BLUE}6.${PLAIN} 查看运行状态
+  ${BLUE}7.${PLAIN} 查看运行日志
+  ${BLUE}8.${PLAIN} 卸载 Grok2API
+  ${BLUE}0.${PLAIN} 退出脚本
+${BLUE}=========================================${PLAIN}"
+    read -p "请选择操作 [0-8]: " choice
+    case $choice in
+        1) install_app ;;
+        2) update_app ;;
+        3) manage_service start ;;
+        4) manage_service stop ;;
+        5) manage_service restart ;;
+        6) manage_service status ;;
+        7) manage_service logs ;;
+        8) uninstall_app ;;
+        0) exit 0 ;;
+    esac
+done
