@@ -51,8 +51,7 @@ get_current_port() {
     local config_path="${INSTALL_DIR}/config.yaml"
     local parsed_port="8000"
     if [ -f "$config_path" ]; then
-        # 自动从 config.yaml 的 listen: 中提取出纯数字端口号
-        parsed_port=$(grep "listen:" "$config_path" | grep -oE "[0-9]+")
+        parsed_port=$(grep "listen:" "$config_path" | sed -E 's/.*:([0-9]+).*/\1/' | tr -d '\r\n ')
     fi
     LISTEN_PORT=${parsed_port:-"8000"}
 }
@@ -114,11 +113,11 @@ interactive_configure() {
     read -p "请输入管理员用户名 [默认: admin]: " admin_user < /dev/tty
     admin_user=${admin_user:-"admin"}
 
-    # 3. 管理员密码
+    # 3. 管理员密码 (解决 broken pipe)
     read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
     local is_random=false
     if [ -z "$admin_pass" ]; then
-        admin_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+        admin_pass=$(head -c 128 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16 2>/dev/null)
         is_random=true
     fi
 
@@ -151,40 +150,30 @@ interactive_configure() {
         redis_pass=${input_redis_pass:-""}
     fi
 
-    # 6. 生成安全随机密钥对
+    # 6. 生成安全随机密钥对 (消除 broken pipe)
     local jwt_secret enc_key
-    if command -v openssl &>/dev/null; then
-        jwt_secret=$(openssl rand -hex 32)
-        enc_key=$(openssl rand -base64 32)
-    else
-        jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
-        enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
-    fi
+    jwt_secret=$(head -c 128 /dev/urandom | tr -dc 'a-f0-9' | head -c 64 2>/dev/null)
+    enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
 
-    # 复制模板
     cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
 
     safe_sed() {
-        if [ "$(uname)" = "Darwin" ]; then
-            sed -i "" "s|$1|$2|g" "$config_path"
-        else
-            sed -i "s|$1|$2|g" "$config_path"
-        fi
+        sed -i "s|$1|$2|g" "$config_path"
     }
 
-    # 执行文本精准替换
+    # 执行文本替换 (匹配不包含特殊字符的独立主键，避开注释中的管道符错误)
     safe_sed 'listen: "127.0.0.1:8000"' "listen: \"0.0.0.0:${port}\""
     safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
     safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
     safe_sed 'username: "admin"' "username: \"${admin_user}\""
     safe_sed 'password: "replace-with-a-strong-password"' "password: \"${admin_pass}\""
     
-    safe_sed 'driver: sqlite # sqlite | postgres' "driver: ${db_driver} # sqlite \| postgres"
+    safe_sed 'driver: sqlite' "driver: ${db_driver}"
     if [ "$db_driver" = "postgres" ]; then
         safe_sed 'dsn: "postgres://user:password@127.0.0.1:5432/grok2api.*"' "dsn: \"${pg_dsn}\""
     fi
 
-    safe_sed 'driver: memory # memory | redis' "driver: ${store_driver} # memory \| redis"
+    safe_sed 'driver: memory' "driver: ${store_driver}"
     if [ "$store_driver" = "redis" ]; then
         safe_sed 'address: "127.0.0.1:6379"' "address: \"${redis_addr}\""
         safe_sed 'password: ""' "password: \"${redis_pass}\""

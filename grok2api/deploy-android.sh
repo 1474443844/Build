@@ -52,7 +52,8 @@ get_current_port() {
     local config_path="${INSTALL_DIR}/config.yaml"
     local parsed_port="8000"
     if [ -f "$config_path" ]; then
-        parsed_port=$(grep "listen:" "$config_path" | grep -oE "[0-9]+")
+        # 精准匹配 listen 中冒号后面的数字，过滤掉 IP 地址中的 0.0.0.0
+        parsed_port=$(grep "listen:" "$config_path" | sed -E 's/.*:([0-9]+).*/\1/' | tr -d '\r\n ')
     fi
     LISTEN_PORT=${parsed_port:-"8000"}
 }
@@ -114,19 +115,19 @@ interactive_configure() {
     read -p "请输入服务运行端口 [默认: 8000]: " input_port < /dev/tty
     local port=${input_port:-"8000"}
 
-    # 2. 用户名
+    # 2. 管理员用户名
     read -p "请输入管理员用户名 [默认: admin]: " admin_user < /dev/tty
     admin_user=${admin_user:-"admin"}
 
-    # 3. 密码
+    # 3. 管理员初始密码 (优化随机生成器，规避 Broken pipe 警告)
     read -p "请输入管理员初始密码 [直接回车将自动生成随机强密码]: " admin_pass < /dev/tty
     local is_random=false
     if [ -z "$admin_pass" ]; then
-        admin_pass=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
+        admin_pass=$(head -c 128 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 16 2>/dev/null)
         is_random=true
     fi
 
-    # 4. 存储 (安卓暂不推荐PG驱动，但脚本予以保留)
+    # 4. 数据库类型选择
     echo -e "\n请选择数据库存储驱动类型："
     echo -e "  1. SQLite (推荐，移动端完全单机运行)"
     echo -e "  2. PostgreSQL"
@@ -139,7 +140,7 @@ interactive_configure() {
         pg_dsn=${input_dsn:-"$pg_dsn"}
     fi
 
-    # 5. 缓存
+    # 5. 缓存类型选择
     echo -e "\n请选择缓存驱动类型："
     echo -e "  1. Memory (轻量、不占额外内存)"
     echo -e "  2. Redis"
@@ -155,9 +156,9 @@ interactive_configure() {
         redis_pass=${input_redis_pass:-""}
     fi
 
-    # 6. 随机密钥
+    # 6. 生成安全随机密钥 (采用安全截取方式，彻底消除 pipe 警告)
     local jwt_secret enc_key
-    jwt_secret=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 64 | head -n 1)
+    jwt_secret=$(head -c 128 /dev/urandom | tr -dc 'a-f0-9' | head -c 64 2>/dev/null)
     enc_key=$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')
 
     cp "${INSTALL_DIR}/config.example.yaml" "$config_path"
@@ -166,18 +167,19 @@ interactive_configure() {
         sed -i "s|$1|$2|g" "$config_path"
     }
 
+    # 执行文本替换 (避免将带有“|”的注释带入 sed，从而彻底消除 unknown option 报错)
     safe_sed 'listen: "127.0.0.1:8000"' "listen: \"0.0.0.0:${port}\""
     safe_sed 'jwtSecret: "replace-with-at-least-32-characters"' "jwtSecret: \"${jwt_secret}\""
     safe_sed 'credentialEncryptionKey: "replace-with-base64-key"' "credentialEncryptionKey: \"${enc_key}\""
     safe_sed 'username: "admin"' "username: \"${admin_user}\""
     safe_sed 'password: "replace-with-a-strong-password"' "password: \"${admin_pass}\""
     
-    safe_sed 'driver: sqlite # sqlite | postgres' "driver: ${db_driver} # sqlite \| postgres"
+    safe_sed 'driver: sqlite' "driver: ${db_driver}"
     if [ "$db_driver" = "postgres" ]; then
         safe_sed 'dsn: "postgres://user:password@127.0.0.1:5432/grok2api.*"' "dsn: \"${pg_dsn}\""
     fi
 
-    safe_sed 'driver: memory # memory | redis' "driver: ${store_driver} # memory \| redis"
+    safe_sed 'driver: memory' "driver: ${store_driver}"
     if [ "$store_driver" = "redis" ]; then
         safe_sed 'address: "127.0.0.1:6379"' "address: \"${redis_addr}\""
         safe_sed 'password: ""' "password: \"${redis_pass}\""
@@ -188,7 +190,7 @@ interactive_configure() {
     echo -e " 🚀 初始管理员凭证已写入配置文件："
     echo -e " 初始账户: ${admin_user}"
     echo -e " 初始密码: ${admin_pass}"
-    [ "$is_random" = "true" ] && echo -e " (提示: 这是系统随机密码，已安全保存！)"
+    [ "$is_random" = "true" ] && echo -e " (提示: 这是系统随机强密码，已安全保存！)"
     echo -e "=======================================================${PLAIN}"
 }
 
@@ -241,7 +243,7 @@ install_app() {
     cd "$INSTALL_DIR" || exit 1
 
     local temp_tar="grok2api_android.tar.gz"
-    echo -e "${BLUE}正在下载安卓包 ${DOWNLOAD_URL} (${LATEST_TAG})...${PLAIN}"
+    echo -e "${BLUE}正在下载安卓包 (${LATEST_TAG})...${PLAIN}"
     if ! curl -L -o "$temp_tar" "$DOWNLOAD_URL"; then
         echo -e "${RED}下载失败，请检查网络。${PLAIN}"
         exit 1
@@ -249,7 +251,7 @@ install_app() {
 
     echo -e "${BLUE}正在解压...${PLAIN}"
     tar -xzf "$temp_tar" --overwrite
-    # rm -f "$temp_tar"
+    rm -f "$temp_tar"
 
     local config_path="${INSTALL_DIR}/config.yaml"
     if [ ! -f "$config_path" ]; then
