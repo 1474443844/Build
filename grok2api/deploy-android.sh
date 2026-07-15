@@ -249,7 +249,7 @@ install_app() {
 
     echo -e "${BLUE}正在解压...${PLAIN}"
     tar -xzf "$temp_tar" --overwrite
-    rm -f "$temp_tar"
+    # rm -f "$temp_tar"
 
     local config_path="${INSTALL_DIR}/config.yaml"
     if [ ! -f "$config_path" ]; then
