@@ -206,7 +206,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-files/*
-          tag_name: ${{ inputs.branch }}
+          tag_name: "grok2api-${{ inputs.branch }}"
           name: "grok2api - ${{ inputs.branch }}" # 将 release 标题与输入的分支/Tag 组合
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
