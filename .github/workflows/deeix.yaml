@@ -1,0 +1,444 @@
+# .github/workflows/build-release.yml
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的 Git Tag（例如 v1.2.3）"
+        required: true
+        type: string
+      platforms:
+        description: "构建平台（多选）"
+        required: true
+        type: choice
+        # GitHub 原生 choice 不支持真正多选，用逗号分隔字符串 + boolean 更稳妥
+        # 见下方 platforms 的 boolean 方案
+      publish_release:
+        description: "是否发布 GitHub Release"
+        required: true
+        type: boolean
+        default: false
+      build_linux_amd64:
+        description: "构建 linux/amd64"
+        type: boolean
+        default: true
+      build_linux_arm64:
+        description: "构建 linux/arm64"
+        type: boolean
+        default: true
+      build_windows_amd64:
+        description: "构建 windows/amd64"
+        type: boolean
+        default: false
+      build_darwin_amd64:
+        description: "构建 darwin/amd64 (macOS Intel)"
+        type: boolean
+        default: false
+      build_darwin_arm64:
+        description: "构建 darwin/arm64 (macOS Apple Silicon)"
+        type: boolean
+        default: false
+      build_android_arm64:
+        description: "构建 android/arm64"
+        type: boolean
+        default: false
+      create_docker_image:
+        description: "是否构建并推送 Docker 镜像（linux）"
+        type: boolean
+        default: false
+      docker_image:
+        description: "Docker 镜像名（create_docker_image=true 时生效）"
+        required: false
+        type: string
+        default: "ghcr.io/OWNER/deeix-chat"
+
+env:
+  GO_VERSION: "1.26"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "9"
+  FRONTEND_DIST_DIR: frontend/out
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 校验 tag 并解析构建矩阵
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_targets: ${{ steps.matrix.outputs.has_targets }}
+    steps:
+      - name: Normalize tag
+        id: meta
+        run: |
+          TAG="${{ inputs.tag }}"
+          TAG="${TAG#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # 去掉前缀 v 作为版本号（可按需调整）
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Using tag=${TAG}, version=${VERSION}"
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify tag points to a commit
+        run: |
+          git rev-parse --verify "refs/tags/${{ steps.meta.outputs.tag }}"^{commit}
+
+      - name: Build matrix JSON
+        id: matrix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const targets = [];
+            const add = (os, arch, runner, cgo = true, extra = {}) => {
+              targets.push({
+                goos: os,
+                goarch: arch,
+                runner,
+                cgo: cgo ? "1" : "0",
+                artifact: `deeix-chat_${os}_${arch}`,
+                ext: os === "windows" ? ".exe" : "",
+                ...extra,
+              });
+            };
+
+            if (context.payload.inputs.build_linux_amd64 === "true") {
+              add("linux", "amd64", "ubuntu-latest");
+            }
+            if (context.payload.inputs.build_linux_arm64 === "true") {
+              // 在 amd64 runner 上交叉编译；若 CGO/sqlite 出问题可改用原生 arm runner
+              add("linux", "arm64", "ubuntu-latest");
+            }
+            if (context.payload.inputs.build_windows_amd64 === "true") {
+              add("windows", "amd64", "ubuntu-latest", true, { cc: "x86_64-w64-mingw32-gcc" });
+            }
+            if (context.payload.inputs.build_darwin_amd64 === "true") {
+              // CGO 在 macOS 上更稳妥
+              add("darwin", "amd64", "macos-13");
+            }
+            if (context.payload.inputs.build_darwin_arm64 === "true") {
+              add("darwin", "arm64", "macos-14");
+            }
+            if (context.payload.inputs.build_android_arm64 === "true") {
+              // Android 交叉编译需要 NDK，这里标记 special 步骤
+              add("android", "arm64", "ubuntu-latest", true, { use_android_ndk: "true" });
+            }
+
+            if (targets.length === 0) {
+              core.setOutput("has_targets", "false");
+              core.setOutput("matrix", JSON.stringify({ include: [{ goos: "none", goarch: "none", runner: "ubuntu-latest" }] }));
+              core.warning("未选择任何二进制平台");
+            } else {
+              core.setOutput("has_targets", "true");
+              core.setOutput("matrix", JSON.stringify({ include: targets }));
+            }
+            console.log(JSON.stringify(targets, null, 2));
+
+  # ---------------------------------------------------------------------------
+  # 2. 构建前端（共享产物，避免每个平台重复 build）
+  # ---------------------------------------------------------------------------
+  build-frontend:
+    name: Build Frontend
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache Next.js
+        uses: actions/cache@v4
+        with:
+          path: frontend/.next/cache
+          key: ${{ runner.os }}-next-${{ hashFiles('frontend/pnpm-lock.yaml') }}-${{ hashFiles('frontend/**/*.[jt]s', 'frontend/**/*.[jt]sx') }}
+          restore-keys: |
+            ${{ runner.os }}-next-
+
+      - name: Install & Build
+        working-directory: frontend
+        env:
+          # 与 Dockerfile 中 ARG 对齐；按需改成仓库变量/secret
+          NEXT_PUBLIC_API_BASE_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL || '' }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-out
+          path: frontend/out
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. 多平台二进制构建
+  # ---------------------------------------------------------------------------
+  build-binary:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [prepare, build-frontend]
+    if: needs.prepare.outputs.has_targets == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-out
+          path: frontend/out
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux' && matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev gcc
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+      - name: Install MinGW for Windows cross-compile
+        if: runner.os == 'Linux' && matrix.goos == 'windows'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+      - name: Setup Android NDK
+        if: matrix.use_android_ndk == 'true'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Build backend
+        working-directory: backend
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GIT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          OUT_NAME="deeix-chat${{ matrix.ext }}"
+          OUT_DIR="${{ github.workspace }}/dist/${{ matrix.artifact }}"
+          mkdir -p "$OUT_DIR"
+
+          # 交叉编译 CGO 环境
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ] && [ "$(uname -m)" != "aarch64" ]; then
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+          fi
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            export CC=x86_64-w64-mingw32-gcc
+            export CXX=x86_64-w64-mingw32-g++
+          fi
+          if [ "${{ matrix.use_android_ndk }}" = "true" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+            export CC="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+            export CXX="${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          fi
+
+          # 若 VERSION 文件存在则优先使用（与 Dockerfile 一致）
+          if [ -f "${{ github.workspace }}/VERSION" ]; then
+            VERSION="$(cat "${{ github.workspace }}/VERSION")"
+          fi
+
+          go build -trimpath \
+            -ldflags="-s -w \
+              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.Version=${VERSION} \
+              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.Commit=${GIT_COMMIT} \
+              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.BuildTime=${BUILD_TIME}" \
+            -o "${OUT_DIR}/${OUT_NAME}" \
+            ./cmd/server
+
+          # 打包前端静态资源与许可证（与镜像布局接近，便于用户直接运行）
+          mkdir -p "${OUT_DIR}/frontend"
+          cp -a "${{ github.workspace }}/frontend/out" "${OUT_DIR}/frontend/out"
+          mkdir -p "${OUT_DIR}/licenses/DEEIX-Chat"
+          cp -a "${{ github.workspace }}/LICENSE" "${OUT_DIR}/licenses/DEEIX-Chat/" 2>/dev/null || true
+          cp -a "${{ github.workspace }}/NOTICE" "${OUT_DIR}/licenses/DEEIX-Chat/" 2>/dev/null || true
+
+          # 写一份简单 README
+          cat > "${OUT_DIR}/README.txt" <<EOF
+          DEEIX-Chat ${VERSION}
+          Platform: ${{ matrix.goos }}/${{ matrix.goarch }}
+          Commit: ${GIT_COMMIT}
+          BuildTime: ${BUILD_TIME}
+
+          Run:
+            FRONTEND_DIST_DIR=./frontend/out ./${OUT_NAME}
+
+          Data volumes (container equivalent):
+            ./storage  ./data
+          EOF
+
+          # 打压缩包
+          cd "${{ github.workspace }}/dist"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r "${{ matrix.artifact }}.zip" "${{ matrix.artifact }}"
+          else
+            tar -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 4. 可选：构建 Docker 镜像（对齐 Dockerfile）
+  # ---------------------------------------------------------------------------
+  build-docker:
+    name: Build Docker Image
+    needs: prepare
+    if: inputs.create_docker_image == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.docker_image }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.event.repository.updated_at }}
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # 5. 可选：发布 GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: [prepare, build-binary, build-docker]
+    # build-docker 可能被跳过：用 always() 再判断
+    if: |
+      always() &&
+      inputs.publish_release == true &&
+      needs.prepare.result == 'success' &&
+      (needs.build-binary.result == 'success' || needs.build-binary.result == 'skipped') &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download all binary artifacts
+        if: needs.build-binary.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: List assets
+        run: |
+          mkdir -p release-assets
+          find release-assets -type f -print || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
