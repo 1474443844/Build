@@ -1,6 +1,5 @@
 name: Build and Release grok2api
 
-# 仅支持手动触发
 on:
   workflow_dispatch:
     inputs:
@@ -24,18 +23,15 @@ on:
         description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
         type: boolean
         default: false
-      # 是否自动创建 Release
       create_release:
         description: '编译完成后是否自动创建 GitHub Release'
         type: boolean
         default: false
 
-# 在全局内置仓库名称
 env:
   TARGET_REPO: 'chenyme/grok2api'
 
 jobs:
-  # 阶段 1：解析用户勾选的平台，动态生成构建矩阵
   setup-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -60,7 +56,6 @@ jobs:
           
           if [ "${{ inputs.windows }}" = "true" ]; then
             append_to_matrix "windows" "amd64" ".exe"
-            append_to_matrix "windows" "arm64" ".exe"
           fi
           
           if [ "${{ inputs.mac }}" = "true" ]; then
@@ -79,18 +74,17 @@ jobs:
           
           echo "matrix=$(echo "$MATRIX_JSON" | jq -c .)" >> $GITHUB_OUTPUT
 
-  # 阶段 2：构建前端静态资源
   build-frontend:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -103,7 +97,7 @@ jobs:
           echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
 
       - name: Setup pnpm cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -121,13 +115,12 @@ jobs:
           pnpm build
 
       - name: Upload frontend assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: frontend-dist
           path: frontend/dist
           retention-days: 1
 
-  # 阶段 3：多平台动态编译 Go 后端并打包
   build-backend:
     needs: [setup-matrix, build-frontend]
     runs-on: ubuntu-latest
@@ -136,19 +129,19 @@ jobs:
         include: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           cache-dependency-path: backend/go.sum
 
       - name: Download frontend assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: frontend-dist
           path: temp-dist
@@ -169,7 +162,6 @@ jobs:
           mv temp-dist release-pkg/frontend/dist
           mv grok2api${{ matrix.suffix }} release-pkg/
           
-          # 进入 release-pkg 目录，使用通配符 * 进行打包，彻底移除顶层 . 目录
           cd release-pkg
           if [ "${{ matrix.goos }}" = "windows" ]; then
             zip -r ../grok2api-${{ matrix.goos }}-${{ matrix.goarch }}.zip *
@@ -178,7 +170,7 @@ jobs:
           fi
 
       - name: Upload packaged binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: grok2api-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -186,7 +178,6 @@ jobs:
             grok2api-*.tar.gz
           retention-days: 7
 
-  # 阶段 4：自动创建 Release（若勾选）
   create-release:
     needs: [setup-matrix, build-backend]
     if: ${{ inputs.create_release == true }}
@@ -195,13 +186,13 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: all-artifacts
 
