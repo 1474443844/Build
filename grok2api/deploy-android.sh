@@ -20,7 +20,6 @@ else
     echo -e "${YELLOW}环境检测：未检测到官方 Termux (可能运行在自定义 PTY 或其它安卓终端中)。${PLAIN}"
 fi
 
-# 基于运行环境建立并管理本地路径缓存文件，实现自定义位置的无感记忆
 PATH_CACHE_FILE=""
 if [ "$IS_TERMUX" = true ]; then
     PATH_CACHE_FILE="$HOME/.grok2api_path"
@@ -33,7 +32,6 @@ else
 fi
 
 get_default_dir() {
-    # 优先从缓存文件中读取曾设定过的自定义路径
     if [ -f "$PATH_CACHE_FILE" ]; then
         DEFAULT_DIR=$(cat "$PATH_CACHE_FILE")
     else
@@ -50,7 +48,6 @@ get_default_dir() {
 }
 
 save_dir_to_cache() {
-    # 保存当前的自定义位置到缓存，以便升级、启停时自动获取
     echo "$INSTALL_DIR" > "$PATH_CACHE_FILE"
 }
 
@@ -81,7 +78,7 @@ start_service() {
     fi
     
     local port
-    read -p "请输入服务运行端口 [默认: 8000]: " port
+    read -p "请输入服务运行端口 [默认: 8000]: " port < /dev/tty
     port=${port:-"8000"}
 
     nohup "${INSTALL_DIR}/grok2api" --config "${INSTALL_DIR}/config.yaml" --listen "0.0.0.0:${port}" > "${INSTALL_DIR}/output.log" 2>&1 &
@@ -114,8 +111,7 @@ stop_service() {
 install_app() {
     get_default_dir
     
-    # 提示并支持用户自定义安装路径
-    read -p "请输入自定义安装目录 [当前/默认: ${DEFAULT_DIR}]: " custom_dir
+    read -p "请输入自定义安装目录 [当前/默认: ${DEFAULT_DIR}]: " custom_dir < /dev/tty
     INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
     save_dir_to_cache
     PID_FILE="${INSTALL_DIR}/grok2api.pid"
@@ -147,8 +143,7 @@ install_app() {
 update_app() {
     get_default_dir
     
-    # 调取并提示用户确认之前的自定义目录
-    read -p "请确认当前运行程序的安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir
+    read -p "请确认当前运行程序的安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir < /dev/tty
     INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
     save_dir_to_cache
     PID_FILE="${INSTALL_DIR}/grok2api.pid"
@@ -184,13 +179,13 @@ ${BLUE}=========================================${PLAIN}
   ${BLUE}4.${PLAIN} 关闭后台服务
   ${BLUE}5.${PLAIN} 退出脚本
 ${BLUE}=========================================${PLAIN}"
-    read -p "请选择操作 [1-5]: " choice
+    read -p "请选择操作 [1-5]: " choice < /dev/tty
     case $choice in
         1) install_app ;;
         2) update_app ;;
         3) 
             get_default_dir
-            read -p "请确认程序安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir
+            read -p "请确认程序安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir < /dev/tty
             INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
             save_dir_to_cache
             PID_FILE="${INSTALL_DIR}/grok2api.pid"
@@ -198,7 +193,7 @@ ${BLUE}=========================================${PLAIN}"
             ;;
         4) 
             get_default_dir
-            read -p "请确认程序安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir
+            read -p "请确认程序安装目录 [默认: ${DEFAULT_DIR}]: " custom_dir < /dev/tty
             INSTALL_DIR=${custom_dir:-"$DEFAULT_DIR"}
             save_dir_to_cache
             PID_FILE="${INSTALL_DIR}/grok2api.pid"

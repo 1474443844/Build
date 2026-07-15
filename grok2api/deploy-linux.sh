@@ -42,7 +42,6 @@ detect_arch() {
 get_current_install_dir() {
     local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
     if [ -f "$service_path" ]; then
-        # 动态读取历史配置中的运行路径
         CURRENT_DIR=$(grep "WorkingDirectory" "$service_path" | cut -d '=' -f 2 | tr -d ' ')
     fi
     INSTALL_DIR=${CURRENT_DIR:-"$DEFAULT_INSTALL_DIR"}
@@ -70,7 +69,7 @@ fetch_latest_release() {
 
 configure_nginx() {
     local backend_port=$1
-    read -p "请输入您的解析域名 (例如 api.example.com 或 localhost): " domain_name
+    read -p "请输入您的解析域名 (例如 api.example.com 或 localhost): " domain_name < /dev/tty
     domain_name=${domain_name:-"localhost"}
 
     echo -e "${BLUE}正在配置 Nginx 反向代理...${PLAIN}"
@@ -129,8 +128,7 @@ install_app() {
     detect_arch
     get_current_install_dir
 
-    # 提示并支持自定义安装路径
-    read -p "请输入自定义安装目录 [当前/默认: ${INSTALL_DIR}]: " custom_dir
+    read -p "请输入自定义安装目录 [当前/默认: ${INSTALL_DIR}]: " custom_dir < /dev/tty
     INSTALL_DIR=${custom_dir:-"$INSTALL_DIR"}
 
     fetch_latest_release
@@ -145,7 +143,7 @@ install_app() {
         exit 1
     fi
 
-    echo -e "${BLUE}正在解压构建包...${PLAIN}"
+    echo -e "${BLUE}正在解压...${PLAIN}"
     tar -xzf "$temp_tar" --overwrite
     rm -f "$temp_tar"
 
@@ -159,7 +157,7 @@ install_app() {
     if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
         current_port=$(grep "ExecStart" "/etc/systemd/system/${SERVICE_NAME}.service" | sed -E 's/.*--listen [^:]+:([0-9]+).*/\1/')
     fi
-    read -p "请输入服务监听端口 [默认: ${current_port}]: " listen_port
+    read -p "请输入服务监听端口 [默认: ${current_port}]: " listen_port < /dev/tty
     listen_port=${listen_port:-"$current_port"}
 
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
@@ -185,7 +183,7 @@ EOF
 
     echo -e "${GREEN}程序安装完成！${PLAIN}"
 
-    read -p "是否需要自动配置 Nginx 反向代理？ [y/N]: " setup_nginx
+    read -p "是否需要自动配置 Nginx 反向代理？ [y/N]: " setup_nginx < /dev/tty
     if [[ "$setup_nginx" =~ ^[Yy]$ ]]; then
         configure_nginx "$listen_port"
     fi
@@ -227,7 +225,7 @@ update_app() {
 
 uninstall_app() {
     get_current_install_dir
-    read -p "确定要彻底卸载吗？ [y/N]: " confirm
+    read -p "确定要彻底卸载吗？ [y/N]: " confirm < /dev/tty
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         systemctl stop "$SERVICE_NAME" &> /dev/null
         systemctl disable "$SERVICE_NAME" &> /dev/null
@@ -238,7 +236,7 @@ uninstall_app() {
         systemctl daemon-reload
         if command -v nginx &> /dev/null; then systemctl reload nginx &> /dev/null; fi
 
-        read -p "是否同时删除安装目录及数据 (${INSTALL_DIR})？ [y/N]: " delete_data
+        read -p "是否同时删除安装目录及数据 (${INSTALL_DIR})？ [y/N]: " delete_data < /dev/tty
         if [[ "$delete_data" =~ ^[Yy]$ ]]; then
             rm -rf "$INSTALL_DIR"
         fi
@@ -277,7 +275,7 @@ ${BLUE}=========================================${PLAIN}
   ${BLUE}8.${PLAIN} 卸载 Grok2API
   ${BLUE}0.${PLAIN} 退出脚本
 ${BLUE}=========================================${PLAIN}"
-    read -p "请选择操作 [0-8]: " choice
+    read -p "请选择操作 [0-8]: " choice < /dev/tty
     case $choice in
         1) install_app ;;
         2) update_app ;;

@@ -29,7 +29,6 @@ detect_arch() {
 
 get_current_install_dir() {
     if [ -f "$PLIST_FILE" ]; then
-        # Natively parse macOS Plist file using system-provided PlistBuddy
         CURRENT_DIR=$(/usr/libexec/PlistBuddy -c "Print :WorkingDirectory" "$PLIST_FILE" 2>/dev/null)
     fi
     INSTALL_DIR=${CURRENT_DIR:-"$DEFAULT_INSTALL_DIR"}
@@ -48,8 +47,7 @@ install_app() {
     detect_arch
     get_current_install_dir
 
-    # 提示自定义安装路径
-    read -p "请输入 Mac 自定义安装目录 [当前/默认: ${INSTALL_DIR}]: " custom_dir
+    read -p "请输入 Mac 自定义安装目录 [当前/默认: ${INSTALL_DIR}]: " custom_dir < /dev/tty
     INSTALL_DIR=${custom_dir:-"$INSTALL_DIR"}
 
     fetch_latest_release
@@ -65,7 +63,7 @@ install_app() {
     local config_path="${INSTALL_DIR}/config.yaml"
     if [ ! -f "$config_path" ]; then touch "$config_path"; fi
 
-    read -p "请输入服务监听端口 [默认: 8000]: " listen_port
+    read -p "请输入服务监听端口 [默认: 8000]: " listen_port < /dev/tty
     listen_port=${listen_port:-"8000"}
 
     launchctl unload "$PLIST_FILE" &> /dev/null
@@ -125,11 +123,11 @@ update_app() {
 
 uninstall_app() {
     get_current_install_dir
-    read -p "确定彻底卸载 Mac 服务吗？ [y/N]: " confirm
+    read -p "确定彻底卸载 Mac 服务吗？ [y/N]: " confirm < /dev/tty
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         launchctl unload "$PLIST_FILE" &> /dev/null
         rm -f "$PLIST_FILE"
-        read -p "是否同时删除数据目录 (${INSTALL_DIR})？ [y/N]: " delete_data
+        read -p "是否同时删除数据目录 (${INSTALL_DIR})？ [y/N]: " delete_data < /dev/tty
         if [[ "$delete_data" =~ ^[Yy]$ ]]; then rm -rf "$INSTALL_DIR"; fi
         echo -e "${GREEN}卸载完成。${PLAIN}"
     fi
@@ -147,7 +145,7 @@ ${BLUE}=========================================${PLAIN}
   ${BLUE}5.${PLAIN} 卸载 Grok2API
   ${BLUE}0.${PLAIN} 退出脚本
 ${BLUE}=========================================${PLAIN}"
-    read -p "请选择操作 [0-5]: " choice
+    read -p "请选择操作 [0-5]: " choice < /dev/tty
     case $choice in
         1) install_app ;;
         2) update_app ;;
