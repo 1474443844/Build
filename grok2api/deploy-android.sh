@@ -11,6 +11,7 @@ BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
 REPO="1474443844/Build"
+PLATFORM="android-arm64"
 
 IS_TERMUX=false
 if [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]; then
@@ -52,21 +53,49 @@ save_dir_to_cache() {
 }
 
 fetch_latest_release() {
-    echo -e "${BLUE}正在从 1474443844/Build 获取最新版本...${PLAIN}"
-    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
-    local release_json
-    release_json=$(curl -s "$api_url")
+    echo -e "${BLUE}正在从 1474443844/Build 检索最新的 grok2api 专属版本...${PLAIN}"
     
-    if [ -z "$release_json" ] || echo "$release_json" | grep -q "message.*Not Found"; then
-        echo -e "${RED}错误：无法获取 GitHub Release 信息，请检查网络。${PLAIN}"
+    LATEST_TAG=""
+    local page=1
+    while true; do
+        echo -e "${BLUE}正在检索 releases 列表第 ${page} 页...${PLAIN}"
+        local releases_json
+        releases_json=$(curl -s "https://api.github.com/repos/${REPO}/releases?per_page=100&page=${page}")
+        
+        if [ -z "$releases_json" ] || echo "$releases_json" | grep -q '"message":'; then
+            echo -e "${RED}错误：获取 GitHub Release 列表失败或已被 API 限流。${PLAIN}"
+            exit 1
+        fi
+        
+        # 如果当前页中完全不包含 tag_name，说明已到最后一页，终止循环
+        if ! echo "$releases_json" | grep -q '"tag_name":'; then
+            break
+        fi
+        
+        # 尝试匹配当前页中第一个以 grok2api- 开头的 Tag
+        LATEST_TAG=$(echo "$releases_json" | grep '"tag_name":' | grep "grok2api-" | head -n 1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+        
+        if [ -n "$LATEST_TAG" ]; then
+            break # 找到了，跳出循环
+        fi
+        
+        page=$((page + 1))
+    done
+
+    if [ -z "$LATEST_TAG" ]; then
+        echo -e "${RED}错误：遍历了所有 Release 页面，仍未找到任何带有 'grok2api-' 前缀的版本。${PLAIN}"
         exit 1
     fi
 
-    LATEST_TAG=$(echo "$release_json" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
-    DOWNLOAD_URL=$(echo "$release_json" | grep "browser_download_url" | grep "android-arm64" | head -n 1 | cut -d '"' -f 4)
+    echo -e "${GREEN}已成功匹配到最新 grok2api 版本: ${LATEST_TAG}${PLAIN}"
+
+    # 定向拉取该指定 Tag 的特定平台资源包
+    local tag_json
+    tag_json=$(curl -s "https://api.github.com/repos/${REPO}/releases/tags/${LATEST_TAG}")
+    DOWNLOAD_URL=$(echo "$tag_json" | grep "browser_download_url" | grep "$PLATFORM" | head -n 1 | cut -d '"' -f 4)
 
     if [ -z "$DOWNLOAD_URL" ]; then
-        echo -e "${RED}错误：未能在最新 Release 中找到安卓 arm64 构建包。${PLAIN}"
+        echo -e "${RED}错误：未能在 Grok2API 版本 (${LATEST_TAG}) 中找到适用于 ${PLATFORM} 的构建包。${PLAIN}"
         exit 1
     fi
 }

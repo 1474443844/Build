@@ -14,7 +14,6 @@ if (-not $CurrentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administ
 }
 
 function Get-InstallDir {
-    # 动态抓取注册于 Windows 计划任务中的自定义物理路径
     $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($existingTask) {
         return $existingTask.Actions[0].WorkingDirectory
@@ -23,20 +22,47 @@ function Get-InstallDir {
 }
 
 function Get-LatestRelease {
-    Write-Host "正在从 1474443844/Build 获取最新 Release 链接..." -ForegroundColor Cyan
-    $api = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
-    $asset = $api.assets | Where-Object { $_.name -like "*windows-amd64.zip" } | Select-Object -First 1
-    return @{ Tag = $api.tag_name; Url = $asset.browser_download_url }
+    Write-Host "正在从 1474443844/Build 检索最新的 grok2api 构建版本..." -ForegroundColor Cyan
+    
+    $targetRelease = $null
+    $page = 1
+    
+    while ($true) {
+        Write-Host "正在检索 releases 列表第 $page 页..." -ForegroundColor Gray
+        # 设定 per_page=100 并结合递增 $page 进行循环抓取，直到找到或检索完毕为止
+        $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=100&page=$page"
+        
+        # 如果获取数据为空，说明已经遍历完所有 Release 仍没有结果
+        if (-not $releases -or $releases.Count -eq 0) {
+            break
+        }
+        
+        # 精准匹配第一个以 grok2api- 开头的版本
+        $targetRelease = $releases | Where-Object { $_.tag_name -like "grok2api-*" } | Select-Object -First 1
+        if ($targetRelease) {
+            break # 找到了，跳出循环
+        }
+        
+        $page++
+    }
+    
+    if (-not $targetRelease) {
+        Write-Error "错误：遍历了所有 Release 仍未找到任何带有 'grok2api-' 前缀的正式版。"
+        return $null
+    }
+    
+    $asset = $targetRelease.assets | Where-Object { $_.name -like "*windows-amd64.zip" } | Select-Object -First 1
+    return @{ Tag = $targetRelease.tag_name; Url = $asset.browser_download_url }
 }
 
 function Install-App {
     $InstallDir = Get-InstallDir
     
-    # 提示并接受 Windows 的自定义目录
     $inputDir = Read-Host "请输入自定义安装路径 [当前/默认: $InstallDir]"
     if ($inputDir) { $InstallDir = $inputDir }
 
     $release = Get-LatestRelease
+    if (-not $release) { return }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     
     $zipPath = "$InstallDir\temp.zip"
@@ -58,7 +84,6 @@ function Install-App {
     if (-not $port) { $port = "8000" }
 
     Write-Host "正在创建 Windows 计划任务实现开机自启后台运行..." -ForegroundColor Cyan
-    # 将自定义路径动态写入 Windows 计划任务的操作和工作目录参数中
     $action = New-ScheduledTaskAction -Execute "$InstallDir\grok2api.exe" -Argument "--config `"$configPath`" --listen 0.0.0.0:$port" -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -78,6 +103,7 @@ function Update-App {
     }
 
     $release = Get-LatestRelease
+    if (-not $release) { return }
     Write-Host "正在备份当前版本并下载更新..." -ForegroundColor Cyan
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Stop-Process -Name "grok2api" -ErrorAction SilentlyContinue

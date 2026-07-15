@@ -35,12 +35,49 @@ get_current_install_dir() {
 }
 
 fetch_latest_release() {
-    echo -e "${BLUE}正在从 1474443844/Build 获取最新 Mac 版本...${PLAIN}"
-    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
-    local release_json
-    release_json=$(curl -s "$api_url")
-    LATEST_TAG=$(echo "$release_json" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
-    DOWNLOAD_URL=$(echo "$release_json" | grep "browser_download_url" | grep "$PLATFORM" | head -n 1 | cut -d '"' -f 4)
+    echo -e "${BLUE}正在从 1474443844/Build 检索最新的 grok2api 专属版本...${PLAIN}"
+    
+    LATEST_TAG=""
+    local page=1
+    while true; do
+        echo -e "${BLUE}正在检索 releases 列表第 ${page} 页...${PLAIN}"
+        local releases_json
+        releases_json=$(curl -s "https://api.github.com/repos/${REPO}/releases?per_page=100&page=${page}")
+        
+        if [ -z "$releases_json" ] || echo "$releases_json" | grep -q '"message":'; then
+            echo -e "${RED}错误：获取 GitHub Release 列表失败，请检查网络。${PLAIN}"
+            exit 1
+        fi
+        
+        if ! echo "$releases_json" | grep -q '"tag_name":'; then
+            break
+        fi
+        
+        LATEST_TAG=$(echo "$releases_json" | grep '"tag_name":' | grep "grok2api-" | head -n 1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+        
+        if [ -n "$LATEST_TAG" ]; then
+            break
+        fi
+        
+        page=$((page + 1))
+    done
+
+    if [ -z "$LATEST_TAG" ]; then
+        echo -e "${RED}错误：遍历了所有 Release 页面，仍未找到任何带有 'grok2api-' 前缀的版本。${PLAIN}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}已成功匹配到最新 grok2api 版本: ${LATEST_TAG}${PLAIN}"
+
+    # 定向拉取该指定 Tag 的特定平台资源包
+    local tag_json
+    tag_json=$(curl -s "https://api.github.com/repos/${REPO}/releases/tags/${LATEST_TAG}")
+    DOWNLOAD_URL=$(echo "$tag_json" | grep "browser_download_url" | grep "$PLATFORM" | head -n 1 | cut -d '"' -f 4)
+
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo -e "${RED}错误：未能在 Grok2API 版本 (${LATEST_TAG}) 中找到适用于 ${PLATFORM} 的构建包。${PLAIN}"
+        exit 1
+    fi
 }
 
 install_app() {
