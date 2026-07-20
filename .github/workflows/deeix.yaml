@@ -19,10 +19,14 @@ on:
         description: '编译 macOS 平台 (包含 Intel amd64, Apple M系列 arm64)'
         type: boolean
         default: true
+      android:
+        description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
+        type: boolean
+        default: false
       next_public_api_base_url:
         description: 'Next.js 编译时内置的 API 基础 URL (NEXT_PUBLIC_API_BASE_URL)'
         required: false
-        default: ''
+        default: 'http://127.0.0.1:8080'
       create_release:
         description: '编译完成后是否自动创建 GitHub Release'
         type: boolean
@@ -51,7 +55,6 @@ jobs:
           }
           
           if [ "${{ inputs.linux }}" = "true" ]; then
-            # Linux 环境采用本地环境或原生 arm64 运行器构建，保障 CGO 动态/静态链接正确
             append_to_matrix "linux" "amd64" "" "ubuntu-latest"
             append_to_matrix "linux" "arm64" "" "ubuntu-latest-arm64"
           fi
@@ -61,9 +64,13 @@ jobs:
           fi
           
           if [ "${{ inputs.mac }}" = "true" ]; then
-            # macOS 运行器支持通过 Clang 原生编译 x86_64 与 arm64 架构
             append_to_matrix "darwin" "amd64" "" "macos-latest"
             append_to_matrix "darwin" "arm64" "" "macos-latest"
+          fi
+
+          if [ "${{ inputs.android }}" = "true" ]; then
+            # Android CGO 编译依赖 NDK，在 Linux Runner 上通过工具链进行交叉编译
+            append_to_matrix "android" "arm64" "" "ubuntu-latest"
           fi
           
           if [ "$(echo "$MATRIX_JSON" | jq 'length')" -eq 0 ]; then
@@ -130,10 +137,17 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Install SQLite Dev Libraries (Linux Only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.goos == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
+
+      - name: Set up NDK (Android Only)
+        if: matrix.goos == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27b
 
       - name: Download frontend assets
         uses: actions/download-artifact@v8
@@ -153,7 +167,11 @@ jobs:
           GIT_COMMIT=${{ github.sha }}
           BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           
-          # 针对 CGO_ENABLED=1，调用本地目标平台的编译器进行构建
+          # 针对 Android CGO 编译，特殊配置 CC 指向 NDK 的 cross-clang 编译器
+          if [ "${{ matrix.goos }}" = "android" ]; then
+            export CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          fi
+          
           go build -trimpath \
             -ldflags="-s -w \
               -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.Version=${VERSION} \
@@ -168,7 +186,7 @@ jobs:
           mv temp-out release-pkg/frontend/out
           mv deeix-chat${{ matrix.suffix }} release-pkg/
           
-          # 根据 Dockerfile 结构复制 License 授权和通告信息文件
+          # 复制 License 授权和通告信息文件
           mkdir -p release-pkg/licenses/DEEIX-Chat
           if [ -f LICENSE ]; then cp LICENSE release-pkg/licenses/DEEIX-Chat/; fi
           if [ -f NOTICE ]; then cp NOTICE release-pkg/licenses/DEEIX-Chat/; fi
