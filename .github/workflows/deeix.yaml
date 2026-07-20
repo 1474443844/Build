@@ -47,7 +47,6 @@ env:
   GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
   ANDROID_API_LEVEL: ${{ inputs.android_api }}
   NDK_VERSION: ${{ inputs.ndk_version }}
-  # SQLite amalgamation（给 sqlite-vec 等需要 sqlite3.h 的 CGO 绑定兜底）
   SQLITE_YEAR: '2025'
   SQLITE_AMALGAMATION: 'sqlite-amalgamation-3490100'
 
@@ -88,9 +87,6 @@ jobs:
           set -euo pipefail
           MATRIX_JSON="[]"
 
-          # 桌面平台使用原生 runner，避免 CGO/SQLite 跨编译问题
-          # linux/arm64 使用 ubuntu-24.04-arm
-          # android 在 ubuntu 上用 NDK 交叉编译
           append_to_matrix() {
             local os=$1
             local arch=$2
@@ -194,7 +190,6 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: backend/go.sum
 
-      # ---------- Linux 原生（amd64 / arm64 runner） ----------
       - name: Install Linux build dependencies
         if: runner.os == 'Linux' && matrix.goos == 'linux'
         shell: bash
@@ -210,7 +205,6 @@ jobs:
           pkg-config --exists sqlite3
           echo "sqlite3 ok: $(pkg-config --modversion sqlite3)"
 
-      # ---------- Windows：MSYS2 提供 mingw gcc + sqlite ----------
       - name: Setup MSYS2 (Windows)
         if: matrix.goos == 'windows'
         uses: msys2/setup-msys2@v2
@@ -225,41 +219,48 @@ jobs:
             zip
             tar
 
+      # 关键：导出 Git Bash 可用的绝对路径（D:/a/_temp/msys64/...），不要导出 /mingw64/...
       - name: Export MSYS2 toolchain paths (Windows)
         if: matrix.goos == 'windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
 
-          MINGW_BIN="$(cygpath -u /mingw64/bin)"
-          PKG_CONFIG_BIN="$(cygpath -u /mingw64/bin/pkg-config)"
-          GCC_BIN="$(cygpath -u /mingw64/bin/gcc)"
-          PKG_CONFIG_PATH_U="$(cygpath -u /mingw64/lib/pkgconfig)"
+          # mixed 路径：D:/a/_temp/msys64/mingw64/bin ，Git Bash 可直接用
+          MINGW_BIN="$(cygpath -m /mingw64/bin)"
+          GCC_BIN="$(cygpath -m /mingw64/bin/gcc.exe)"
+          GXX_BIN="$(cygpath -m /mingw64/bin/g++.exe)"
+          PKG_CONFIG_PATH_M="$(cygpath -m /mingw64/lib/pkgconfig)"
 
-          # 兼容：有的环境是 pkgconf
-          if [ ! -x "$PKG_CONFIG_BIN" ] && [ -x /mingw64/bin/pkgconf ]; then
-            PKG_CONFIG_BIN="$(cygpath -u /mingw64/bin/pkgconf)"
+          if [ -x /mingw64/bin/pkg-config.exe ]; then
+            PKG_CONFIG_BIN="$(cygpath -m /mingw64/bin/pkg-config.exe)"
+          elif [ -x /mingw64/bin/pkgconf.exe ]; then
+            PKG_CONFIG_BIN="$(cygpath -m /mingw64/bin/pkgconf.exe)"
+          else
+            echo "pkg-config/pkgconf not found in MSYS2 mingw64" >&2
+            ls -la /mingw64/bin | head -n 50
+            exit 1
           fi
 
-          test -x "$GCC_BIN"
-          test -x "$PKG_CONFIG_BIN"
+          test -f "$GCC_BIN"
+          test -f "$PKG_CONFIG_BIN"
 
-          echo "MSYS2_MINGW64_BIN=$MINGW_BIN" >> "$GITHUB_ENV"
-          echo "MSYS2_GCC=$GCC_BIN" >> "$GITHUB_ENV"
-          echo "MSYS2_PKG_CONFIG=$PKG_CONFIG_BIN" >> "$GITHUB_ENV"
-          echo "MSYS2_PKG_CONFIG_PATH=$PKG_CONFIG_PATH_U" >> "$GITHUB_ENV"
+          {
+            echo "MSYS2_MINGW64_BIN=${MINGW_BIN}"
+            echo "MSYS2_GCC=${GCC_BIN}"
+            echo "MSYS2_GXX=${GXX_BIN}"
+            echo "MSYS2_PKG_CONFIG=${PKG_CONFIG_BIN}"
+            echo "MSYS2_PKG_CONFIG_PATH=${PKG_CONFIG_PATH_M}"
+          } >> "$GITHUB_ENV"
 
-          # 也导出 Windows 风格路径，给 bash 兜底
-          echo "MSYS2_MINGW64_BIN_WIN=$(cygpath -m /mingw64/bin)" >> "$GITHUB_ENV"
-
-          echo "GCC=$GCC_BIN"
+          echo "MINGW_BIN=${MINGW_BIN}"
+          echo "GCC=${GCC_BIN}"
+          echo "PKG_CONFIG=${PKG_CONFIG_BIN}"
           "$GCC_BIN" --version | head -1
-          echo "PKG_CONFIG=$PKG_CONFIG_BIN"
           "$PKG_CONFIG_BIN" --version || true
-          PKG_CONFIG_PATH="$PKG_CONFIG_PATH_U" "$PKG_CONFIG_BIN" --exists sqlite3
-          echo "sqlite3: $(PKG_CONFIG_PATH="$PKG_CONFIG_PATH_U" "$PKG_CONFIG_BIN" --modversion sqlite3)"
+          PKG_CONFIG_PATH="$PKG_CONFIG_PATH_M" "$PKG_CONFIG_BIN" --exists sqlite3
+          echo "sqlite3: $(PKG_CONFIG_PATH="$PKG_CONFIG_PATH_M" "$PKG_CONFIG_BIN" --modversion sqlite3)"
 
-      # ---------- macOS ----------
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         shell: bash
@@ -268,7 +269,6 @@ jobs:
           brew list sqlite >/dev/null 2>&1 || brew install sqlite
           brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
 
-      # ---------- Android：host 工具 + NDK ----------
       - name: Install host tools (Android)
         if: matrix.goos == 'android'
         shell: bash
@@ -328,7 +328,6 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-      # ---------- SQLite amalgamation 兜底（Windows / Android） ----------
       - name: Prepare SQLite amalgamation
         if: matrix.goos == 'android' || matrix.goos == 'windows'
         shell: bash
@@ -352,8 +351,17 @@ jobs:
           fi
 
           test -f "$SQLITE_DIR/sqlite3.h"
-          echo "SQLITE_SRC=$SQLITE_DIR" >> "$GITHUB_ENV"
-          echo "SQLite amalgamation ready: $SQLITE_DIR"
+
+          # Git Bash 友好路径
+          SQLITE_SRC_UNIX="$SQLITE_DIR"
+          if command -v cygpath >/dev/null 2>&1; then
+            SQLITE_SRC_UNIX="$(cygpath -m "$SQLITE_DIR")"
+          else
+            SQLITE_SRC_UNIX="$(echo "$SQLITE_DIR" | sed -E 's#\\#/#g')"
+          fi
+
+          echo "SQLITE_SRC=${SQLITE_SRC_UNIX}" >> "$GITHUB_ENV"
+          echo "SQLite amalgamation ready: ${SQLITE_SRC_UNIX}"
 
       - name: Download frontend assets
         uses: actions/download-artifact@v4
@@ -380,7 +388,6 @@ jobs:
           echo "git_commit=${GIT_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION} commit=${GIT_COMMIT} time=${BUILD_TIME}"
 
-      # ---------- Unix 构建：linux / darwin / android ----------
       - name: Build Go Backend (Unix)
         if: matrix.goos != 'windows'
         shell: bash
@@ -410,7 +417,6 @@ jobs:
             export CGO_LDFLAGS="-L$(brew --prefix sqlite)/lib ${CGO_LDFLAGS:-}"
 
           else
-            # linux 原生（含 arm64 runner）
             export CC="${{ matrix.cc }}"
           fi
 
@@ -429,7 +435,6 @@ jobs:
           file "../deeix-chat${{ matrix.suffix }}" || true
           ls -lah "../deeix-chat${{ matrix.suffix }}"
 
-      # ---------- Windows 构建：bash + setup-go 的 go + MSYS2 mingw ----------
       - name: Build Go Backend (Windows)
         if: matrix.goos == 'windows'
         shell: bash
@@ -442,18 +447,37 @@ jobs:
 
           go version
 
-          if [ -z "${MSYS2_GCC:-}" ] || [ -z "${MSYS2_PKG_CONFIG:-}" ]; then
+          if [ -z "${MSYS2_GCC:-}" ] || [ -z "${MSYS2_PKG_CONFIG:-}" ] || [ -z "${MSYS2_MINGW64_BIN:-}" ]; then
             echo "::error::MSYS2 toolchain env is empty"
             env | sort
             exit 1
           fi
 
-          # 清理会抢 PATH 的干扰项（Strawberry / 系统 MinGW）
+          # 转成 Git Bash 可用路径（D:/...）
+          to_gitbash_path() {
+            local p="$1"
+            if command -v cygpath >/dev/null 2>&1; then
+              cygpath -m "$p"
+            else
+              echo "$p" | sed -E 's#\\#/#g'
+            fi
+          }
+
+          MINGW_BIN="$(to_gitbash_path "${MSYS2_MINGW64_BIN}")"
+          CC_BIN="$(to_gitbash_path "${MSYS2_GCC}")"
+          CXX_BIN="$(to_gitbash_path "${MSYS2_GXX:-${MSYS2_MINGW64_BIN}/g++.exe}")"
+          PKG_CONFIG_BIN="$(to_gitbash_path "${MSYS2_PKG_CONFIG}")"
+          PKG_CONFIG_PATH_VAL="$(to_gitbash_path "${MSYS2_PKG_CONFIG_PATH}")"
+
+          test -f "$CC_BIN" || { echo "gcc not found: $CC_BIN"; ls -la "$MINGW_BIN" | head; exit 1; }
+          test -f "$PKG_CONFIG_BIN" || { echo "pkg-config not found: $PKG_CONFIG_BIN"; exit 1; }
+
+          # 清理干扰 PATH：只踢 Strawberry 和系统 C:/mingw64，不踢 MSYS2
           CLEAN_PATH=""
           IFS=':' read -ra PARTS <<< "$PATH"
           for p in "${PARTS[@]}"; do
             case "$p" in
-              /c/Strawberry/*|*/Strawberry/*|/c/mingw64/*|*/mingw64/bin)
+              /c/Strawberry/*|*/Strawberry/*|/c/mingw64|/c/mingw64/*|*/Git/mingw64/*)
                 echo "Skipping PATH entry: $p"
                 continue
                 ;;
@@ -465,18 +489,18 @@ jobs:
             fi
           done
 
-          # MSYS2 mingw 必须在最前
-          export PATH="${MSYS2_MINGW64_BIN}:${CLEAN_PATH}"
-          export PKG_CONFIG_PATH="${MSYS2_PKG_CONFIG_PATH}"
-          export PKG_CONFIG="${MSYS2_PKG_CONFIG}"
-          export CC="${MSYS2_GCC}"
-          export CXX="${MSYS2_MINGW64_BIN}/g++"
+          export PATH="${MINGW_BIN}:${CLEAN_PATH}"
+          export PKG_CONFIG_PATH="${PKG_CONFIG_PATH_VAL}"
+          export PKG_CONFIG="${PKG_CONFIG_BIN}"
+          export CC="${CC_BIN}"
+          export CXX="${CXX_BIN}"
 
-          # 校验没有再用到错误的工具
-          echo "which gcc: $(command -v gcc)"
+          echo "MINGW_BIN=${MINGW_BIN}"
+          echo "CC=${CC}"
+          echo "CXX=${CXX}"
+          echo "PKG_CONFIG=${PKG_CONFIG}"
+          echo "which gcc: $(command -v gcc || true)"
           echo "which pkg-config: $(command -v pkg-config || true)"
-          echo "CC=$CC"
-          echo "PKG_CONFIG=$PKG_CONFIG"
 
           "$CC" --version | head -2
           "$PKG_CONFIG" --version || true
@@ -485,16 +509,13 @@ jobs:
           echo "sqlite cflags: $("$PKG_CONFIG" --cflags sqlite3)"
           echo "sqlite libs: $("$PKG_CONFIG" --libs sqlite3)"
 
-          # SQLITE_SRC 转 Unix 路径
+          SQLITE_INC=""
           if [ -n "${SQLITE_SRC:-}" ]; then
-            if command -v cygpath >/dev/null 2>&1; then
-              SQLITE_SRC="$(cygpath -u "${SQLITE_SRC}")"
-            else
-              SQLITE_SRC="$(echo "${SQLITE_SRC}" | sed -E 's#^([A-Za-z]):[\\/]#/\L\1/#; s#\\#/#g')"
-            fi
+            SQLITE_SRC="$(to_gitbash_path "${SQLITE_SRC}")"
+            SQLITE_INC="-I${SQLITE_SRC}"
           fi
 
-          export CGO_CFLAGS="$("$PKG_CONFIG" --cflags sqlite3) ${SQLITE_SRC:+-I${SQLITE_SRC}}"
+          export CGO_CFLAGS="$("$PKG_CONFIG" --cflags sqlite3) ${SQLITE_INC}"
           export CGO_LDFLAGS="$("$PKG_CONFIG" --libs sqlite3)"
 
           cd backend
@@ -513,7 +534,6 @@ jobs:
 
           ls -lah ../deeix-chat.exe
 
-      
       - name: Package Release Archive
         shell: bash
         run: |
@@ -571,11 +591,10 @@ jobs:
           ARCHIVE_BASE="deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}"
 
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            # 优先使用 MSYS2 zip；否则用 PowerShell
             if command -v zip >/dev/null 2>&1; then
               zip -r "../${ARCHIVE_BASE}.zip" .
-            elif [ -n "${MSYS2_MINGW64_BIN:-}" ] && [ -x "${MSYS2_MINGW64_BIN}/zip" ]; then
-              "${MSYS2_MINGW64_BIN}/zip" -r "../${ARCHIVE_BASE}.zip" .
+            elif [ -n "${MSYS2_MINGW64_BIN:-}" ] && [ -x "${MSYS2_MINGW64_BIN}/zip.exe" ]; then
+              "${MSYS2_MINGW64_BIN}/zip.exe" -r "../${ARCHIVE_BASE}.zip" .
             else
               powershell.exe -NoProfile -Command "Compress-Archive -Path * -DestinationPath '../${ARCHIVE_BASE}.zip' -Force"
             fi
