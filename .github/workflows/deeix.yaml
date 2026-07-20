@@ -16,24 +16,21 @@ on:
         type: boolean
         default: true
       mac:
-        description: '编译 macOS 平台 (包含 Intel amd64, Apple M系列 arm64)'
+        description: '编译 macOS 平台 (包含 Intel amd64, Apple Silicon arm64)'
         type: boolean
         default: true
-      android:
-        description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
-        type: boolean
-        default: false
-      next_public_api_base_url:
-        description: 'Next.js 编译时内置的 API 基础 URL (NEXT_PUBLIC_API_BASE_URL)'
-        required: false
-        default: 'http://127.0.0.1:8080'
       create_release:
         description: '编译完成后是否自动创建 GitHub Release'
         type: boolean
         default: false
+      next_public_api_base_url:
+        description: '前端构建时的 NEXT_PUBLIC_API_BASE_URL（可留空）'
+        required: false
+        default: ''
 
 env:
   TARGET_REPO: 'DEEIX-AI/DEEIX-Chat'
+  GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
 
 jobs:
   setup-matrix:
@@ -45,171 +42,257 @@ jobs:
         id: set-matrix
         run: |
           MATRIX_JSON="[]"
-          
+
           append_to_matrix() {
             local os=$1
             local arch=$2
-            local suffix=$3
-            local runner=$4
-            MATRIX_JSON=$(echo "$MATRIX_JSON" | jq --arg os "$os" --arg arch "$arch" --arg suffix "$suffix" --arg runner "$runner" '. += [{"goos": $os, "goarch": $arch, "suffix": $suffix, "runner": $runner}]')
+            local runner=$3
+            local suffix=$4
+            local cc=$5
+            MATRIX_JSON=$(echo "$MATRIX_JSON" | jq \
+              --arg os "$os" \
+              --arg arch "$arch" \
+              --arg runner "$runner" \
+              --arg suffix "$suffix" \
+              --arg cc "$cc" \
+              '. += [{"goos": $os, "goarch": $arch, "runner": $runner, "suffix": $suffix, "cc": $cc}]')
           }
-          
+
           if [ "${{ inputs.linux }}" = "true" ]; then
-            append_to_matrix "linux" "amd64" "" "ubuntu-latest"
-            append_to_matrix "linux" "arm64" "" "ubuntu-latest-arm64"
-          fi
-          
-          if [ "${{ inputs.windows }}" = "true" ]; then
-            append_to_matrix "windows" "amd64" ".exe" "windows-latest"
-          fi
-          
-          if [ "${{ inputs.mac }}" = "true" ]; then
-            append_to_matrix "darwin" "amd64" "" "macos-latest"
-            append_to_matrix "darwin" "arm64" "" "macos-latest"
+            append_to_matrix "linux" "amd64" "ubuntu-latest" "" "gcc"
+            append_to_matrix "linux" "arm64" "ubuntu-latest" "" "aarch64-linux-gnu-gcc"
           fi
 
-          if [ "${{ inputs.android }}" = "true" ]; then
-            # Android CGO 编译依赖 NDK，在 Linux Runner 上通过工具链进行交叉编译
-            append_to_matrix "android" "arm64" "" "ubuntu-latest"
+          if [ "${{ inputs.windows }}" = "true" ]; then
+            append_to_matrix "windows" "amd64" "ubuntu-latest" ".exe" "x86_64-w64-mingw32-gcc"
           fi
-          
+
+          if [ "${{ inputs.mac }}" = "true" ]; then
+            # macOS 需要本机 SDK / 系统库，使用 macOS runner
+            append_to_matrix "darwin" "amd64" "macos-15" "" "clang"
+            append_to_matrix "darwin" "arm64" "macos-15" "" "clang"
+          fi
+
           if [ "$(echo "$MATRIX_JSON" | jq 'length')" -eq 0 ]; then
             echo "错误：未选择任何平台！请至少选择一个编译平台。" >&2
             exit 1
           fi
-          
-          echo "matrix=$(echo "$MATRIX_JSON" | jq -c .)" >> $GITHUB_OUTPUT
+
+          echo "matrix=$(echo "$MATRIX_JSON" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   build-frontend:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Enable Corepack
-        run: corepack enable
+        run: |
+          corepack enable
+          corepack prepare pnpm@latest --activate
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
 
-      - name: Install workspace dependencies
+      - name: Install frontend dependencies
         run: |
           pnpm install --frozen-lockfile --prefer-offline --filter @deeix/web
 
       - name: Build frontend
         env:
           NEXT_PUBLIC_API_BASE_URL: ${{ inputs.next_public_api_base_url }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         run: |
           cd frontend
           pnpm build
 
       - name: Upload frontend assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: frontend-out
           path: frontend/out
           retention-days: 1
+          if-no-files-found: error
 
   build-backend:
     needs: [setup-matrix, build-frontend]
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v5
         with:
           go-version: '1.26'
           cache-dependency-path: backend/go.sum
 
-      - name: Install SQLite Dev Libraries (Linux Only)
-        if: runner.os == 'Linux' && matrix.goos == 'linux'
+      - name: Install Linux/Windows build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libsqlite3-dev \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            zip
 
-      - name: Set up NDK (Android Only)
-        if: matrix.goos == 'android'
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r27b
+          # 为 linux/arm64 交叉编译准备 SQLite 头文件/库
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libsqlite3-dev:arm64 \
+              || true
+          fi
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
 
       - name: Download frontend assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           name: frontend-out
-          path: temp-out
+          path: temp-frontend-out
+
+      - name: Read version metadata
+        id: meta
+        shell: bash
+        run: |
+          if [ -f VERSION ]; then
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+          else
+            VERSION="${{ inputs.branch }}"
+          fi
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "git_commit=${GIT_COMMIT}" >> "$GITHUB_OUTPUT"
 
       - name: Build Go Backend
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
         run: |
+          set -euo pipefail
           cd backend
-          VERSION=$(cat ../VERSION)
-          GIT_COMMIT=${{ github.sha }}
-          BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          
-          # 针对 Android CGO 编译，特殊配置 CC 指向 NDK 的 cross-clang 编译器
-          if [ "${{ matrix.goos }}" = "android" ]; then
-            export CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+
+          # macOS 下优先使用 Homebrew SQLite
+          if [ "${{ matrix.goos }}" = "darwin" ]; then
+            export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            export CGO_CFLAGS="-I$(brew --prefix sqlite)/include ${CGO_CFLAGS:-}"
+            export CGO_LDFLAGS="-L$(brew --prefix sqlite)/lib ${CGO_LDFLAGS:-}"
           fi
-          
+
+          # Windows 交叉编译时关闭 auto-import 相关噪音
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            export CGO_LDFLAGS="-static-libgcc -static-libstdc++ ${CGO_LDFLAGS:-}"
+          fi
+
+          # linux/arm64 交叉编译
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+            export PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
+            export CGO_CFLAGS="-I/usr/include ${CGO_CFLAGS:-}"
+            export CGO_LDFLAGS="-L/usr/lib/aarch64-linux-gnu ${CGO_LDFLAGS:-}"
+          fi
+
           go build -trimpath \
             -ldflags="-s -w \
-              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.Version=${VERSION} \
-              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.Commit=${GIT_COMMIT} \
-              -X github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo.BuildTime=${BUILD_TIME}" \
-            -o ../deeix-chat${{ matrix.suffix }} ./cmd/server
+              -X ${{ env.GO_PACKAGE }}.Version=${{ steps.meta.outputs.version }} \
+              -X ${{ env.GO_PACKAGE }}.Commit=${{ steps.meta.outputs.git_commit }} \
+              -X ${{ env.GO_PACKAGE }}.BuildTime=${{ steps.meta.outputs.build_time }}" \
+            -o "../deeix-chat${{ matrix.suffix }}" \
+            ./cmd/server
 
       - name: Package Release Archive
         shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p release-pkg/frontend
-          mv temp-out release-pkg/frontend/out
-          mv deeix-chat${{ matrix.suffix }} release-pkg/
-          
-          # 复制 License 授权和通告信息文件
           mkdir -p release-pkg/licenses/DEEIX-Chat
-          if [ -f LICENSE ]; then cp LICENSE release-pkg/licenses/DEEIX-Chat/; fi
-          if [ -f NOTICE ]; then cp NOTICE release-pkg/licenses/DEEIX-Chat/; fi
-          
-          # 复制常用基础配置文件和版本标识
-          if [ -f config.example.yaml ]; then cp config.example.yaml release-pkg/; fi
-          if [ -f VERSION ]; then cp VERSION release-pkg/; fi
-          
+          mkdir -p release-pkg/storage release-pkg/data
+
+          mv temp-frontend-out release-pkg/frontend/out
+          mv "deeix-chat${{ matrix.suffix }}" release-pkg/
+
+          # 与 Dockerfile runtime 阶段保持一致
+          if [ -f LICENSE ]; then
+            cp LICENSE release-pkg/licenses/DEEIX-Chat/
+          fi
+          if [ -f NOTICE ]; then
+            cp NOTICE release-pkg/licenses/DEEIX-Chat/
+          fi
+          if [ -f VERSION ]; then
+            cp VERSION release-pkg/VERSION
+          fi
+          if [ -f config.example.yaml ]; then
+            cp config.example.yaml release-pkg/config.example.yaml
+          elif [ -f backend/config.example.yaml ]; then
+            cp backend/config.example.yaml release-pkg/config.example.yaml
+          fi
+
+          # 运行说明（方便用户直接启动）
+          cat > release-pkg/README-RELEASE.txt <<EOF
+          DEEIX-Chat Release Package
+          Platform: ${{ matrix.goos }}/${{ matrix.goarch }}
+          Version: ${{ steps.meta.outputs.version }}
+          Commit: ${{ steps.meta.outputs.git_commit }}
+          BuildTime: ${{ steps.meta.outputs.build_time }}
+
+          启动前请确保：
+          1. 可执行文件与 frontend/out 在同一包内
+          2. 默认监听 8080
+          3. 数据目录建议挂载/使用 ./storage 与 ./data
+
+          环境变量：
+          FRONTEND_DIST_DIR=./frontend/out
+          EOF
+
           cd release-pkg
+          ARCHIVE_BASE="deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}"
+
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip -r ../deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}.zip *
+            zip -r "../${ARCHIVE_BASE}.zip" .
           else
-            tar -czf ../deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz *
+            tar -czf "../${ARCHIVE_BASE}.tar.gz" .
           fi
 
       - name: Upload packaged binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             deeix-chat-*.zip
             deeix-chat-*.tar.gz
           retention-days: 7
+          if-no-files-found: error
 
   create-release:
     needs: [setup-matrix, build-backend]
@@ -219,27 +302,62 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
+      - name: Resolve release metadata
+        id: release-meta
+        shell: bash
+        run: |
+          if [ -f VERSION ]; then
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+          else
+            VERSION="${{ inputs.branch }}"
+          fi
+
+          # tag 做简单清洗，避免非法字符
+          SAFE_TAG="$(echo "deeix-chat-${VERSION}" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: all-artifacts
 
       - name: Flatten directory structure
         run: |
           mkdir -p release-files
-          find all-artifacts -name "*.zip" -exec cp {} release-files/ \;
-          find all-artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
+          find all-artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
+          ls -lah release-files
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           files: release-files/*
-          tag_name: "deeix-chat-${{ inputs.branch }}"
-          name: "DEEIX-Chat - ${{ inputs.branch }}"
+          tag_name: ${{ steps.release-meta.outputs.tag }}
+          name: "DEEIX-Chat ${{ steps.release-meta.outputs.version }}"
+          body: |
+            ## DEEIX-Chat ${{ steps.release-meta.outputs.version }}
+
+            构建来源：`${{ inputs.branch }}`
+
+            ### 包内容
+            - `deeix-chat` 可执行文件
+            - `frontend/out` 前端静态资源
+            - `licenses/DEEIX-Chat` 许可证文件
+            - `storage/` / `data/` 数据目录占位
+
+            ### 运行示例
+            ```bash
+            export FRONTEND_DIST_DIR=./frontend/out
+            ./deeix-chat
+            ```
+            默认端口：`8080`
+          draft: false
+          prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
