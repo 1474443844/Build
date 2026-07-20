@@ -47,6 +47,9 @@ env:
   GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
   ANDROID_API_LEVEL: ${{ inputs.android_api }}
   NDK_VERSION: ${{ inputs.ndk_version }}
+  # SQLite amalgamation（给需要 sqlite3.h 的 CGO 绑定使用）
+  SQLITE_YEAR: '2025'
+  SQLITE_AMALGAMATION: 'sqlite-amalgamation-3490100'
 
 permissions:
   contents: write
@@ -85,6 +88,10 @@ jobs:
           set -euo pipefail
           MATRIX_JSON="[]"
 
+          # 说明：
+          # - linux/windows/mac 使用「原生 runner」，避免 CGO/SQLite 跨编译
+          # - linux/arm64 使用 GitHub ARM runner: ubuntu-24.04-arm
+          # - android 仍在 ubuntu 上用 NDK 交叉编译
           append_to_matrix() {
             local os=$1
             local arch=$2
@@ -102,11 +109,11 @@ jobs:
 
           if [ "${{ inputs.linux }}" = "true" ]; then
             append_to_matrix "linux" "amd64" "ubuntu-latest" "" "gcc"
-            append_to_matrix "linux" "arm64" "ubuntu-latest" "" "aarch64-linux-gnu-gcc"
+            append_to_matrix "linux" "arm64" "ubuntu-24.04-arm" "" "gcc"
           fi
 
           if [ "${{ inputs.windows }}" = "true" ]; then
-            append_to_matrix "windows" "amd64" "ubuntu-latest" ".exe" "x86_64-w64-mingw32-gcc"
+            append_to_matrix "windows" "amd64" "windows-latest" ".exe" "gcc"
           fi
 
           if [ "${{ inputs.mac }}" = "true" ]; then
@@ -115,7 +122,6 @@ jobs:
           fi
 
           if [ "${{ inputs.android }}" = "true" ]; then
-            # Android 仅 arm64；CC 在构建步骤由 NDK 设置
             append_to_matrix "android" "arm64" "ubuntu-latest" "" "ndk"
           fi
 
@@ -189,8 +195,10 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: backend/go.sum
 
-      - name: Install Linux/Windows build dependencies
-        if: runner.os == 'Linux' && matrix.goos != 'android'
+      # ---------- Linux 原生依赖（amd64 / arm64 runner 都走这里） ----------
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux' && matrix.goos == 'linux'
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -198,22 +206,37 @@ jobs:
             build-essential \
             pkg-config \
             libsqlite3-dev \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            gcc-mingw-w64-x86-64 \
-            g++-mingw-w64-x86-64 \
             zip
+          pkg-config --exists sqlite3
+          echo "sqlite3 ok: $(pkg-config --modversion sqlite3)"
 
-          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
-            sudo dpkg --add-architecture arm64
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends \
-              libsqlite3-dev:arm64 \
-              || true
-          fi
+      # ---------- Windows 原生：MSYS2 + mingw + sqlite ----------
+      - name: Setup MSYS2 (Windows)
+        if: matrix.goos == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-sqlite3
+            zip
+            tar
 
+      # ---------- macOS 依赖 ----------
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list sqlite >/dev/null 2>&1 || brew install sqlite
+          brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+
+      # ---------- Android：host 工具 + NDK ----------
       - name: Install host tools (Android)
         if: matrix.goos == 'android'
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -229,6 +252,7 @@ jobs:
 
       - name: Download & extract Android NDK
         if: matrix.goos == 'android' && steps.cache-ndk.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -249,6 +273,7 @@ jobs:
 
       - name: Verify Android NDK
         if: matrix.goos == 'android'
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -268,12 +293,32 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-      - name: Install macOS build dependencies
-        if: runner.os == 'macOS'
+      # ---------- 为 Android / 兜底准备 sqlite amalgamation（提供 sqlite3.h） ----------
+      - name: Prepare SQLite amalgamation
+        if: matrix.goos == 'android' || matrix.goos == 'windows'
+        shell: bash
         run: |
           set -euo pipefail
-          brew list sqlite >/dev/null 2>&1 || brew install sqlite
-          brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+
+          SQLITE_DIR="${{ github.workspace }}/.deps/${{ env.SQLITE_AMALGAMATION }}"
+          ZIP_NAME="${{ env.SQLITE_AMALGAMATION }}.zip"
+          URL="https://www.sqlite.org/${{ env.SQLITE_YEAR }}/${ZIP_NAME}"
+
+          mkdir -p "${{ github.workspace }}/.deps"
+          if [ ! -f "$SQLITE_DIR/sqlite3.h" ]; then
+            echo "Downloading $URL"
+            if command -v wget >/dev/null 2>&1; then
+              wget -q -O "/tmp/${ZIP_NAME}" "$URL"
+            else
+              curl -fsSL -o "/tmp/${ZIP_NAME}" "$URL"
+            fi
+            unzip -q "/tmp/${ZIP_NAME}" -d "${{ github.workspace }}/.deps"
+            rm -f "/tmp/${ZIP_NAME}"
+          fi
+
+          test -f "$SQLITE_DIR/sqlite3.h"
+          echo "SQLITE_SRC=$SQLITE_DIR" >> "$GITHUB_ENV"
+          echo "SQLite amalgamation ready: $SQLITE_DIR"
 
       - name: Download frontend assets
         uses: actions/download-artifact@v4
@@ -300,7 +345,8 @@ jobs:
           echo "git_commit=${GIT_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION} commit=${GIT_COMMIT} time=${BUILD_TIME}"
 
-      - name: Build Go Backend
+      - name: Build Go Backend (Unix)
+        if: matrix.goos != 'windows'
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
@@ -310,48 +356,32 @@ jobs:
           set -euo pipefail
           cd backend
 
-          CC="${{ matrix.cc }}"
-          CXX=""
-
           if [ "${{ matrix.goos }}" = "android" ]; then
             NDK="${ANDROID_NDK_HOME:-${{ github.workspace }}/.ndk/android-ndk-${{ env.NDK_VERSION }}}"
             API="${{ env.ANDROID_API_LEVEL }}"
             PREBUILT="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-            CC="$PREBUILT/bin/aarch64-linux-android${API}-clang"
-            CXX="$PREBUILT/bin/aarch64-linux-android${API}-clang++"
+            export CC="$PREBUILT/bin/aarch64-linux-android${API}-clang"
+            export CXX="$PREBUILT/bin/aarch64-linux-android${API}-clang++"
+            test -x "$CC"
 
-            if [ ! -x "$CC" ]; then
-              echo "Android NDK clang not found: $CC" >&2
-              ls -la "$PREBUILT/bin" | head -n 50 || true
-              exit 1
-            fi
-
-            export CC CXX
-            export CGO_ENABLED=1
-            export CGO_CFLAGS="-fPIC"
+            # sqlite-vec 需要 sqlite3.h
+            export CGO_CFLAGS="-fPIC -I${SQLITE_SRC}"
             export CGO_LDFLAGS="-fPIC"
 
           elif [ "${{ matrix.goos }}" = "darwin" ]; then
-            export CC="$CC"
+            export CC="${{ matrix.cc }}"
             export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
             export CGO_CFLAGS="-I$(brew --prefix sqlite)/include ${CGO_CFLAGS:-}"
             export CGO_LDFLAGS="-L$(brew --prefix sqlite)/lib ${CGO_LDFLAGS:-}"
 
-          elif [ "${{ matrix.goos }}" = "windows" ]; then
-            export CC="$CC"
-            export CGO_LDFLAGS="-static-libgcc -static-libstdc++ ${CGO_LDFLAGS:-}"
-
-          elif [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
-            export CC="$CC"
-            export PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
-            export CGO_CFLAGS="-I/usr/include ${CGO_CFLAGS:-}"
-            export CGO_LDFLAGS="-L/usr/lib/aarch64-linux-gnu ${CGO_LDFLAGS:-}"
-
           else
-            export CC="$CC"
+            # linux 原生（含 arm64 runner）
+            export CC="${{ matrix.cc }}"
           fi
 
           echo "Building with GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED CC=${CC:-default}"
+          echo "CGO_CFLAGS=${CGO_CFLAGS:-}"
+          echo "CGO_LDFLAGS=${CGO_LDFLAGS:-}"
 
           go build -trimpath \
             -ldflags="-s -w \
@@ -363,6 +393,55 @@ jobs:
 
           file "../deeix-chat${{ matrix.suffix }}" || true
           ls -lah "../deeix-chat${{ matrix.suffix }}"
+
+      - name: Build Go Backend (Windows / MSYS2)
+        if: matrix.goos == 'windows'
+        shell: msys2 {0}
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+
+          # 让 msys2 能找到 actions/setup-go 安装的 go
+          export PATH="/mingw64/bin:${PATH}"
+          if ! command -v go >/dev/null 2>&1; then
+            # setup-go 通常装在这个位置（GitHub hosted windows）
+            if [ -x "/c/Program Files/Go/bin/go.exe" ]; then
+              export PATH="/c/Program Files/Go/bin:${PATH}"
+            fi
+            # 也尝试 GITHUB 工具缓存路径
+            if [ -n "${GOROOT:-}" ]; then
+              export PATH="${GOROOT}/bin:${PATH}"
+            fi
+          fi
+
+          go version
+          gcc --version | head -2
+          pkg-config --exists sqlite3
+          echo "sqlite3: $(pkg-config --modversion sqlite3)"
+
+          # 双保险：系统 sqlite + amalgamation 头文件
+          SQLITE_SRC="${SQLITE_SRC:-}"
+          export CC=gcc
+          export CGO_CFLAGS="$(pkg-config --cflags sqlite3) ${SQLITE_SRC:+-I$SQLITE_SRC}"
+          export CGO_LDFLAGS="$(pkg-config --libs sqlite3)"
+
+          cd backend
+          echo "Building with GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED CC=$CC"
+          echo "CGO_CFLAGS=$CGO_CFLAGS"
+          echo "CGO_LDFLAGS=$CGO_LDFLAGS"
+
+          go build -trimpath \
+            -ldflags="-s -w \
+              -X ${{ env.GO_PACKAGE }}.Version=${{ steps.meta.outputs.version }} \
+              -X ${{ env.GO_PACKAGE }}.Commit=${{ steps.meta.outputs.git_commit }} \
+              -X ${{ env.GO_PACKAGE }}.BuildTime=${{ steps.meta.outputs.build_time }}" \
+            -o "../deeix-chat.exe" \
+            ./cmd/server
+
+          ls -lah ../deeix-chat.exe
 
       - name: Package Release Archive
         shell: bash
@@ -412,7 +491,7 @@ jobs:
 
           Android 说明：
           - 产物为 arm64 可执行文件，需在 Android 终端环境（如 Termux）中运行
-          - 不是 APK；若需要安装包，请另行做 Android 壳工程封装
+          - 不是 APK
           - min API: ${{ env.ANDROID_API_LEVEL }}
           - NDK: ${{ env.NDK_VERSION }}
           EOF
@@ -421,12 +500,17 @@ jobs:
           ARCHIVE_BASE="deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}"
 
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            zip -r "../${ARCHIVE_BASE}.zip" .
+            if command -v zip >/dev/null 2>&1; then
+              zip -r "../${ARCHIVE_BASE}.zip" .
+            else
+              # windows-latest 通常有 tar；用 zip 失败时兜底
+              powershell.exe -NoProfile -Command "Compress-Archive -Path * -DestinationPath '../${ARCHIVE_BASE}.zip' -Force"
+            fi
           else
             tar -czf "../${ARCHIVE_BASE}.tar.gz" .
           fi
 
-          ls -lah ../deeix-chat-*
+          ls -lah ../deeix-chat-* || true
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@v4
