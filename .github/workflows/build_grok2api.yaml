@@ -83,26 +83,15 @@ jobs:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ inputs.branch }}
 
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22
-
-      - name: Install pnpm
-        run: npm install -g pnpm
-
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-      - name: Setup pnpm cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Install dependencies
         run: |
@@ -161,7 +150,14 @@ jobs:
           mkdir -p release-pkg/frontend
           mv temp-dist release-pkg/frontend/dist
           mv grok2api${{ matrix.suffix }} release-pkg/
-          cp config.example.yaml release-pkg/config.example.yaml
+          
+          # 安全复制配置文件与版本文件（若存在）
+          if [ -f config.example.yaml ]; then
+            cp config.example.yaml release-pkg/config.example.yaml
+          fi
+          if [ -f VERSION ]; then
+            cp VERSION release-pkg/VERSION
+          fi
           
           cd release-pkg
           if [ "${{ matrix.goos }}" = "windows" ]; then
@@ -208,6 +204,6 @@ jobs:
         with:
           files: release-files/*
           tag_name: "grok2api-${{ inputs.branch }}"
-          name: "grok2api - ${{ inputs.branch }}" # 将 release 标题与输入的分支/Tag 组合
+          name: "grok2api - ${{ inputs.branch }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
