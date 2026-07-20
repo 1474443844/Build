@@ -217,10 +217,10 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          path-type: inherit
+          path-type: minimal
           install: >-
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-sqlite3
             zip
             tar
@@ -230,12 +230,34 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          echo "MSYS2_MINGW64_BIN=$(cygpath -u /mingw64/bin)" >> "$GITHUB_ENV"
-          echo "MSYS2_PKG_CONFIG_PATH=$(cygpath -u /mingw64/lib/pkgconfig)" >> "$GITHUB_ENV"
-          gcc --version | head -1
-          ls /mingw64/bin/gcc.exe
-          pkg-config --exists sqlite3
-          echo "sqlite3: $(pkg-config --modversion sqlite3)"
+
+          MINGW_BIN="$(cygpath -u /mingw64/bin)"
+          PKG_CONFIG_BIN="$(cygpath -u /mingw64/bin/pkg-config)"
+          GCC_BIN="$(cygpath -u /mingw64/bin/gcc)"
+          PKG_CONFIG_PATH_U="$(cygpath -u /mingw64/lib/pkgconfig)"
+
+          # 兼容：有的环境是 pkgconf
+          if [ ! -x "$PKG_CONFIG_BIN" ] && [ -x /mingw64/bin/pkgconf ]; then
+            PKG_CONFIG_BIN="$(cygpath -u /mingw64/bin/pkgconf)"
+          fi
+
+          test -x "$GCC_BIN"
+          test -x "$PKG_CONFIG_BIN"
+
+          echo "MSYS2_MINGW64_BIN=$MINGW_BIN" >> "$GITHUB_ENV"
+          echo "MSYS2_GCC=$GCC_BIN" >> "$GITHUB_ENV"
+          echo "MSYS2_PKG_CONFIG=$PKG_CONFIG_BIN" >> "$GITHUB_ENV"
+          echo "MSYS2_PKG_CONFIG_PATH=$PKG_CONFIG_PATH_U" >> "$GITHUB_ENV"
+
+          # 也导出 Windows 风格路径，给 bash 兜底
+          echo "MSYS2_MINGW64_BIN_WIN=$(cygpath -m /mingw64/bin)" >> "$GITHUB_ENV"
+
+          echo "GCC=$GCC_BIN"
+          "$GCC_BIN" --version | head -1
+          echo "PKG_CONFIG=$PKG_CONFIG_BIN"
+          "$PKG_CONFIG_BIN" --version || true
+          PKG_CONFIG_PATH="$PKG_CONFIG_PATH_U" "$PKG_CONFIG_BIN" --exists sqlite3
+          echo "sqlite3: $(PKG_CONFIG_PATH="$PKG_CONFIG_PATH_U" "$PKG_CONFIG_BIN" --modversion sqlite3)"
 
       # ---------- macOS ----------
       - name: Install macOS build dependencies
@@ -418,42 +440,65 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 使用 setup-go 提供的 go（bash 可直接找到）
           go version
 
-          # 注入 MSYS2 mingw 工具链
-          if [ -z "${MSYS2_MINGW64_BIN:-}" ]; then
-            echo "::error::MSYS2_MINGW64_BIN is empty; Setup MSYS2 step may have failed"
+          if [ -z "${MSYS2_GCC:-}" ] || [ -z "${MSYS2_PKG_CONFIG:-}" ]; then
+            echo "::error::MSYS2 toolchain env is empty"
+            env | sort
             exit 1
           fi
-          export PATH="${MSYS2_MINGW64_BIN}:${PATH}"
-          export PKG_CONFIG_PATH="${MSYS2_PKG_CONFIG_PATH:-}:${PKG_CONFIG_PATH:-}"
 
-          command -v gcc
-          gcc --version | head -2
-          command -v pkg-config
-          pkg-config --exists sqlite3
-          echo "sqlite3: $(pkg-config --modversion sqlite3)"
+          # 清理会抢 PATH 的干扰项（Strawberry / 系统 MinGW）
+          CLEAN_PATH=""
+          IFS=':' read -ra PARTS <<< "$PATH"
+          for p in "${PARTS[@]}"; do
+            case "$p" in
+              /c/Strawberry/*|*/Strawberry/*|/c/mingw64/*|*/mingw64/bin)
+                echo "Skipping PATH entry: $p"
+                continue
+                ;;
+            esac
+            if [ -n "$CLEAN_PATH" ]; then
+              CLEAN_PATH="${CLEAN_PATH}:$p"
+            else
+              CLEAN_PATH="$p"
+            fi
+          done
 
-          # SQLITE_SRC 转成 Unix 风格路径，避免 -ID:\... 问题
+          # MSYS2 mingw 必须在最前
+          export PATH="${MSYS2_MINGW64_BIN}:${CLEAN_PATH}"
+          export PKG_CONFIG_PATH="${MSYS2_PKG_CONFIG_PATH}"
+          export PKG_CONFIG="${MSYS2_PKG_CONFIG}"
+          export CC="${MSYS2_GCC}"
+          export CXX="${MSYS2_MINGW64_BIN}/g++"
+
+          # 校验没有再用到错误的工具
+          echo "which gcc: $(command -v gcc)"
+          echo "which pkg-config: $(command -v pkg-config || true)"
+          echo "CC=$CC"
+          echo "PKG_CONFIG=$PKG_CONFIG"
+
+          "$CC" --version | head -2
+          "$PKG_CONFIG" --version || true
+          "$PKG_CONFIG" --exists sqlite3
+          echo "sqlite3: $("$PKG_CONFIG" --modversion sqlite3)"
+          echo "sqlite cflags: $("$PKG_CONFIG" --cflags sqlite3)"
+          echo "sqlite libs: $("$PKG_CONFIG" --libs sqlite3)"
+
+          # SQLITE_SRC 转 Unix 路径
           if [ -n "${SQLITE_SRC:-}" ]; then
             if command -v cygpath >/dev/null 2>&1; then
               SQLITE_SRC="$(cygpath -u "${SQLITE_SRC}")"
             else
-              # 简易转换：D:\a\... -> /d/a/...
               SQLITE_SRC="$(echo "${SQLITE_SRC}" | sed -E 's#^([A-Za-z]):[\\/]#/\L\1/#; s#\\#/#g')"
             fi
           fi
 
-          export CC=gcc
-          export CXX=g++
-          export CGO_CFLAGS="$(pkg-config --cflags sqlite3) ${SQLITE_SRC:+-I${SQLITE_SRC}}"
-          export CGO_LDFLAGS="$(pkg-config --libs sqlite3)"
+          export CGO_CFLAGS="$("$PKG_CONFIG" --cflags sqlite3) ${SQLITE_SRC:+-I${SQLITE_SRC}}"
+          export CGO_LDFLAGS="$("$PKG_CONFIG" --libs sqlite3)"
 
           cd backend
-          echo "Building with GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=${CGO_ENABLED} CC=${CC}"
-          echo "PATH=${PATH}"
-          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
+          echo "Building with GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=${CGO_ENABLED}"
           echo "CGO_CFLAGS=${CGO_CFLAGS}"
           echo "CGO_LDFLAGS=${CGO_LDFLAGS}"
           echo "SQLITE_SRC=${SQLITE_SRC:-}"
@@ -468,6 +513,7 @@ jobs:
 
           ls -lah ../deeix-chat.exe
 
+      
       - name: Package Release Archive
         shell: bash
         run: |
