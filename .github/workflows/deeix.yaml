@@ -47,7 +47,7 @@ env:
   GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
   ANDROID_API_LEVEL: ${{ inputs.android_api }}
   NDK_VERSION: ${{ inputs.ndk_version }}
-  # SQLite amalgamation（给需要 sqlite3.h 的 CGO 绑定使用）
+  # SQLite amalgamation（给 sqlite-vec 等需要 sqlite3.h 的 CGO 绑定兜底）
   SQLITE_YEAR: '2025'
   SQLITE_AMALGAMATION: 'sqlite-amalgamation-3490100'
 
@@ -88,10 +88,9 @@ jobs:
           set -euo pipefail
           MATRIX_JSON="[]"
 
-          # 说明：
-          # - linux/windows/mac 使用「原生 runner」，避免 CGO/SQLite 跨编译
-          # - linux/arm64 使用 GitHub ARM runner: ubuntu-24.04-arm
-          # - android 仍在 ubuntu 上用 NDK 交叉编译
+          # 桌面平台使用原生 runner，避免 CGO/SQLite 跨编译问题
+          # linux/arm64 使用 ubuntu-24.04-arm
+          # android 在 ubuntu 上用 NDK 交叉编译
           append_to_matrix() {
             local os=$1
             local arch=$2
@@ -195,7 +194,7 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: backend/go.sum
 
-      # ---------- Linux 原生依赖（amd64 / arm64 runner 都走这里） ----------
+      # ---------- Linux 原生（amd64 / arm64 runner） ----------
       - name: Install Linux build dependencies
         if: runner.os == 'Linux' && matrix.goos == 'linux'
         shell: bash
@@ -206,17 +205,19 @@ jobs:
             build-essential \
             pkg-config \
             libsqlite3-dev \
-            zip
+            zip \
+            file
           pkg-config --exists sqlite3
           echo "sqlite3 ok: $(pkg-config --modversion sqlite3)"
 
-      # ---------- Windows 原生：MSYS2 + mingw + sqlite ----------
+      # ---------- Windows：MSYS2 提供 mingw gcc + sqlite ----------
       - name: Setup MSYS2 (Windows)
         if: matrix.goos == 'windows'
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
+          path-type: inherit
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkg-config
@@ -224,7 +225,19 @@ jobs:
             zip
             tar
 
-      # ---------- macOS 依赖 ----------
+      - name: Export MSYS2 toolchain paths (Windows)
+        if: matrix.goos == 'windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          echo "MSYS2_MINGW64_BIN=$(cygpath -u /mingw64/bin)" >> "$GITHUB_ENV"
+          echo "MSYS2_PKG_CONFIG_PATH=$(cygpath -u /mingw64/lib/pkgconfig)" >> "$GITHUB_ENV"
+          gcc --version | head -1
+          ls /mingw64/bin/gcc.exe
+          pkg-config --exists sqlite3
+          echo "sqlite3: $(pkg-config --modversion sqlite3)"
+
+      # ---------- macOS ----------
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         shell: bash
@@ -293,7 +306,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-      # ---------- 为 Android / 兜底准备 sqlite amalgamation（提供 sqlite3.h） ----------
+      # ---------- SQLite amalgamation 兜底（Windows / Android） ----------
       - name: Prepare SQLite amalgamation
         if: matrix.goos == 'android' || matrix.goos == 'windows'
         shell: bash
@@ -345,6 +358,7 @@ jobs:
           echo "git_commit=${GIT_COMMIT}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION} commit=${GIT_COMMIT} time=${BUILD_TIME}"
 
+      # ---------- Unix 构建：linux / darwin / android ----------
       - name: Build Go Backend (Unix)
         if: matrix.goos != 'windows'
         shell: bash
@@ -364,7 +378,6 @@ jobs:
             export CXX="$PREBUILT/bin/aarch64-linux-android${API}-clang++"
             test -x "$CC"
 
-            # sqlite-vec 需要 sqlite3.h
             export CGO_CFLAGS="-fPIC -I${SQLITE_SRC}"
             export CGO_LDFLAGS="-fPIC"
 
@@ -394,9 +407,10 @@ jobs:
           file "../deeix-chat${{ matrix.suffix }}" || true
           ls -lah "../deeix-chat${{ matrix.suffix }}"
 
-      - name: Build Go Backend (Windows / MSYS2)
+      # ---------- Windows 构建：bash + setup-go 的 go + MSYS2 mingw ----------
+      - name: Build Go Backend (Windows)
         if: matrix.goos == 'windows'
-        shell: msys2 {0}
+        shell: bash
         env:
           GOOS: windows
           GOARCH: amd64
@@ -404,34 +418,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 让 msys2 能找到 actions/setup-go 安装的 go
-          export PATH="/mingw64/bin:${PATH}"
-          if ! command -v go >/dev/null 2>&1; then
-            # setup-go 通常装在这个位置（GitHub hosted windows）
-            if [ -x "/c/Program Files/Go/bin/go.exe" ]; then
-              export PATH="/c/Program Files/Go/bin:${PATH}"
-            fi
-            # 也尝试 GITHUB 工具缓存路径
-            if [ -n "${GOROOT:-}" ]; then
-              export PATH="${GOROOT}/bin:${PATH}"
-            fi
-          fi
-
+          # 使用 setup-go 提供的 go（bash 可直接找到）
           go version
+
+          # 注入 MSYS2 mingw 工具链
+          if [ -z "${MSYS2_MINGW64_BIN:-}" ]; then
+            echo "::error::MSYS2_MINGW64_BIN is empty; Setup MSYS2 step may have failed"
+            exit 1
+          fi
+          export PATH="${MSYS2_MINGW64_BIN}:${PATH}"
+          export PKG_CONFIG_PATH="${MSYS2_PKG_CONFIG_PATH:-}:${PKG_CONFIG_PATH:-}"
+
+          command -v gcc
           gcc --version | head -2
+          command -v pkg-config
           pkg-config --exists sqlite3
           echo "sqlite3: $(pkg-config --modversion sqlite3)"
 
-          # 双保险：系统 sqlite + amalgamation 头文件
-          SQLITE_SRC="${SQLITE_SRC:-}"
+          # SQLITE_SRC 转成 Unix 风格路径，避免 -ID:\... 问题
+          if [ -n "${SQLITE_SRC:-}" ]; then
+            if command -v cygpath >/dev/null 2>&1; then
+              SQLITE_SRC="$(cygpath -u "${SQLITE_SRC}")"
+            else
+              # 简易转换：D:\a\... -> /d/a/...
+              SQLITE_SRC="$(echo "${SQLITE_SRC}" | sed -E 's#^([A-Za-z]):[\\/]#/\L\1/#; s#\\#/#g')"
+            fi
+          fi
+
           export CC=gcc
-          export CGO_CFLAGS="$(pkg-config --cflags sqlite3) ${SQLITE_SRC:+-I$SQLITE_SRC}"
+          export CXX=g++
+          export CGO_CFLAGS="$(pkg-config --cflags sqlite3) ${SQLITE_SRC:+-I${SQLITE_SRC}}"
           export CGO_LDFLAGS="$(pkg-config --libs sqlite3)"
 
           cd backend
-          echo "Building with GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED CC=$CC"
-          echo "CGO_CFLAGS=$CGO_CFLAGS"
-          echo "CGO_LDFLAGS=$CGO_LDFLAGS"
+          echo "Building with GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=${CGO_ENABLED} CC=${CC}"
+          echo "PATH=${PATH}"
+          echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}"
+          echo "CGO_CFLAGS=${CGO_CFLAGS}"
+          echo "CGO_LDFLAGS=${CGO_LDFLAGS}"
+          echo "SQLITE_SRC=${SQLITE_SRC:-}"
 
           go build -trimpath \
             -ldflags="-s -w \
@@ -500,10 +525,12 @@ jobs:
           ARCHIVE_BASE="deeix-chat-${{ matrix.goos }}-${{ matrix.goarch }}"
 
           if [ "${{ matrix.goos }}" = "windows" ]; then
+            # 优先使用 MSYS2 zip；否则用 PowerShell
             if command -v zip >/dev/null 2>&1; then
               zip -r "../${ARCHIVE_BASE}.zip" .
+            elif [ -n "${MSYS2_MINGW64_BIN:-}" ] && [ -x "${MSYS2_MINGW64_BIN}/zip" ]; then
+              "${MSYS2_MINGW64_BIN}/zip" -r "../${ARCHIVE_BASE}.zip" .
             else
-              # windows-latest 通常有 tar；用 zip 失败时兜底
               powershell.exe -NoProfile -Command "Compress-Archive -Path * -DestinationPath '../${ARCHIVE_BASE}.zip' -Force"
             fi
           else
