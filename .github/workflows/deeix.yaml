@@ -19,6 +19,10 @@ on:
         description: '编译 macOS 平台 (包含 Intel amd64, Apple Silicon arm64)'
         type: boolean
         default: true
+      android:
+        description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
+        type: boolean
+        default: false
       create_release:
         description: '编译完成后是否自动创建 GitHub Release'
         type: boolean
@@ -31,6 +35,8 @@ on:
 env:
   TARGET_REPO: 'DEEIX-AI/DEEIX-Chat'
   GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
+  ANDROID_API_LEVEL: '24'
+  ANDROID_NDK_VERSION: '27.2.12479018'
 
 jobs:
   setup-matrix:
@@ -68,9 +74,13 @@ jobs:
           fi
 
           if [ "${{ inputs.mac }}" = "true" ]; then
-            # macOS 需要本机 SDK / 系统库，使用 macOS runner
             append_to_matrix "darwin" "amd64" "macos-15" "" "clang"
             append_to_matrix "darwin" "arm64" "macos-15" "" "clang"
+          fi
+
+          if [ "${{ inputs.android }}" = "true" ]; then
+            # Android 仅 arm64；CC 在构建步骤里由 NDK 动态设置
+            append_to_matrix "android" "arm64" "ubuntu-latest" "" "ndk"
           fi
 
           if [ "$(echo "$MATRIX_JSON" | jq 'length')" -eq 0 ]; then
@@ -142,7 +152,7 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Install Linux/Windows build dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.goos != 'android'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -155,7 +165,6 @@ jobs:
             g++-mingw-w64-x86-64 \
             zip
 
-          # 为 linux/arm64 交叉编译准备 SQLite 头文件/库
           if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
             sudo dpkg --add-architecture arm64
             sudo apt-get update
@@ -163,6 +172,38 @@ jobs:
               libsqlite3-dev:arm64 \
               || true
           fi
+
+      - name: Install Android NDK
+        if: matrix.goos == 'android'
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unzip zip wget
+
+          # 安装 commandlinetools + NDK
+          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          cd /tmp
+
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" \
+            "ndk;${{ env.ANDROID_NDK_VERSION }}" \
+            "platforms;android-${{ env.ANDROID_API_LEVEL }}"
+
+          NDK_HOME="$ANDROID_SDK_ROOT/ndk/${{ env.ANDROID_NDK_VERSION }}"
+          if [ ! -d "$NDK_HOME" ]; then
+            echo "NDK not found at $NDK_HOME" >&2
+            ls -la "$ANDROID_SDK_ROOT/ndk" || true
+            exit 1
+          fi
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
 
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
@@ -198,29 +239,54 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '1'
-          CC: ${{ matrix.cc }}
         run: |
           set -euo pipefail
           cd backend
 
-          # macOS 下优先使用 Homebrew SQLite
-          if [ "${{ matrix.goos }}" = "darwin" ]; then
+          CC="${{ matrix.cc }}"
+          CXX=""
+
+          # --- 平台相关工具链 ---
+          if [ "${{ matrix.goos }}" = "android" ]; then
+            # Android arm64 + NDK clang
+            PREBUILT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            API="${{ env.ANDROID_API_LEVEL }}"
+            CC="$PREBUILT/bin/aarch64-linux-android${API}-clang"
+            CXX="$PREBUILT/bin/aarch64-linux-android${API}-clang++"
+
+            if [ ! -x "$CC" ]; then
+              echo "Android NDK clang not found: $CC" >&2
+              ls -la "$PREBUILT/bin" | head -n 50 || true
+              exit 1
+            fi
+
+            export CC CXX
+            export CGO_CFLAGS="-fPIC"
+            export CGO_LDFLAGS="-fPIC"
+            # mattn/go-sqlite3 会走 CGO，使用 NDK 编译内嵌 sqlite 源码
+            export CGO_ENABLED=1
+
+          elif [ "${{ matrix.goos }}" = "darwin" ]; then
+            export CC="$CC"
             export PKG_CONFIG_PATH="$(brew --prefix sqlite)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
             export CGO_CFLAGS="-I$(brew --prefix sqlite)/include ${CGO_CFLAGS:-}"
             export CGO_LDFLAGS="-L$(brew --prefix sqlite)/lib ${CGO_LDFLAGS:-}"
-          fi
 
-          # Windows 交叉编译时关闭 auto-import 相关噪音
-          if [ "${{ matrix.goos }}" = "windows" ]; then
+          elif [ "${{ matrix.goos }}" = "windows" ]; then
+            export CC="$CC"
             export CGO_LDFLAGS="-static-libgcc -static-libstdc++ ${CGO_LDFLAGS:-}"
-          fi
 
-          # linux/arm64 交叉编译
-          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+          elif [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+            export CC="$CC"
             export PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
             export CGO_CFLAGS="-I/usr/include ${CGO_CFLAGS:-}"
             export CGO_LDFLAGS="-L/usr/lib/aarch64-linux-gnu ${CGO_LDFLAGS:-}"
+
+          else
+            export CC="$CC"
           fi
+
+          echo "Building with GOOS=$GOOS GOARCH=$GOARCH CC=${CC:-default}"
 
           go build -trimpath \
             -ldflags="-s -w \
@@ -242,7 +308,6 @@ jobs:
           mv temp-frontend-out release-pkg/frontend/out
           mv "deeix-chat${{ matrix.suffix }}" release-pkg/
 
-          # 与 Dockerfile runtime 阶段保持一致
           if [ -f LICENSE ]; then
             cp LICENSE release-pkg/licenses/DEEIX-Chat/
           fi
@@ -258,7 +323,6 @@ jobs:
             cp backend/config.example.yaml release-pkg/config.example.yaml
           fi
 
-          # 运行说明（方便用户直接启动）
           cat > release-pkg/README-RELEASE.txt <<EOF
           DEEIX-Chat Release Package
           Platform: ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -269,10 +333,14 @@ jobs:
           启动前请确保：
           1. 可执行文件与 frontend/out 在同一包内
           2. 默认监听 8080
-          3. 数据目录建议挂载/使用 ./storage 与 ./data
+          3. 数据目录建议使用 ./storage 与 ./data
 
           环境变量：
           FRONTEND_DIST_DIR=./frontend/out
+
+          Android 说明：
+          - 产物为 arm64 可执行文件，需在 Android 终端环境（如 Termux）中运行
+          - 不是 APK；若需要安装包，请另行做 Android 壳工程封装
           EOF
 
           cd release-pkg
@@ -317,7 +385,6 @@ jobs:
             VERSION="${{ inputs.branch }}"
           fi
 
-          # tag 做简单清洗，避免非法字符
           SAFE_TAG="$(echo "deeix-chat-${VERSION}" | sed 's/[^A-Za-z0-9._-]/-/g')"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${SAFE_TAG}" >> "$GITHUB_OUTPUT"
@@ -349,6 +416,12 @@ jobs:
             - `frontend/out` 前端静态资源
             - `licenses/DEEIX-Chat` 许可证文件
             - `storage/` / `data/` 数据目录占位
+
+            ### 支持平台
+            - Linux amd64 / arm64
+            - Windows amd64
+            - macOS amd64 / arm64
+            - Android arm64（二进制，非 APK）
 
             ### 运行示例
             ```bash
