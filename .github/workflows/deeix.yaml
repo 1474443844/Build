@@ -525,8 +525,8 @@ jobs:
           fi
           if [ -f config.example.yaml ]; then
             cp config.example.yaml release-pkg/config.example.yaml
-          elif [ -f backend/config.example.yaml ]; then
-            cp backend/config.example.yaml release-pkg/config.example.yaml
+            cp config.full.example.yaml release-pkg/config.full.example.yaml
+            cp config.sqlite.example.yaml release-pkg/config.sqlite.example.yaml
           fi
 
           cat > release-pkg/README-RELEASE.txt <<EOF
