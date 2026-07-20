@@ -20,9 +20,19 @@ on:
         type: boolean
         default: true
       android:
-        description: '编译 Android 平台 (仅支持 arm64 实体手机架构)'
+        description: '编译 Android 平台 (仅支持 arm64)'
         type: boolean
         default: false
+      android_api:
+        description: 'Android 最低 API level（仅 android 构建使用）'
+        required: true
+        type: string
+        default: '24'
+      ndk_version:
+        description: 'NDK 版本名（对应 android-ndk-<name>-linux.zip，如 r27d）'
+        required: true
+        type: string
+        default: 'r27d'
       create_release:
         description: '编译完成后是否自动创建 GitHub Release'
         type: boolean
@@ -35,8 +45,15 @@ on:
 env:
   TARGET_REPO: 'DEEIX-AI/DEEIX-Chat'
   GO_PACKAGE: 'github.com/DEEIX-AI/DEEIX-Chat/backend/internal/shared/buildinfo'
-  ANDROID_API_LEVEL: '24'
-  ANDROID_NDK_VERSION: '27.2.12479018'
+  ANDROID_API_LEVEL: ${{ inputs.android_api }}
+  NDK_VERSION: ${{ inputs.ndk_version }}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-deeix-chat-${{ github.ref }}-${{ inputs.branch }}-${{ inputs.linux }}-${{ inputs.windows }}-${{ inputs.mac }}-${{ inputs.android }}
+  cancel-in-progress: true
 
 jobs:
   setup-matrix:
@@ -44,9 +61,28 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.android }}" = "true" ]; then
+            API="${{ inputs.android_api }}"
+            NDK_VERSION="${{ inputs.ndk_version }}"
+
+            if [[ ! "$API" =~ ^[0-9]+$ ]] || (( API < 21 || API > 35 )); then
+              echo "::error::android_api must be an integer 21–35 (got: $API)"
+              exit 1
+            fi
+            if [[ ! "$NDK_VERSION" =~ ^r[0-9]+[a-z]?$ ]]; then
+              echo "::error::ndk_version must look like r27d (got: $NDK_VERSION)"
+              exit 1
+            fi
+          fi
+
       - name: Generate matrix
         id: set-matrix
         run: |
+          set -euo pipefail
           MATRIX_JSON="[]"
 
           append_to_matrix() {
@@ -79,7 +115,7 @@ jobs:
           fi
 
           if [ "${{ inputs.android }}" = "true" ]; then
-            # Android 仅 arm64；CC 在构建步骤里由 NDK 动态设置
+            # Android 仅 arm64；CC 在构建步骤由 NDK 设置
             append_to_matrix "android" "arm64" "ubuntu-latest" "" "ndk"
           fi
 
@@ -89,6 +125,7 @@ jobs:
           fi
 
           echo "matrix=$(echo "$MATRIX_JSON" | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "Selected matrix: $MATRIX_JSON"
 
   build-frontend:
     runs-on: ubuntu-latest
@@ -134,6 +171,7 @@ jobs:
   build-backend:
     needs: [setup-matrix, build-frontend]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -154,8 +192,9 @@ jobs:
       - name: Install Linux/Windows build dependencies
         if: runner.os == 'Linux' && matrix.goos != 'android'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
             build-essential \
             pkg-config \
             libsqlite3-dev \
@@ -167,47 +206,72 @@ jobs:
 
           if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
             sudo dpkg --add-architecture arm64
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends \
               libsqlite3-dev:arm64 \
               || true
           fi
 
-      - name: Install Android NDK
+      - name: Install host tools (Android)
+        if: matrix.goos == 'android'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wget unzip ca-certificates file
+
+      - name: Cache Android NDK
+        if: matrix.goos == 'android'
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ndk/android-ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Download & extract Android NDK
+        if: matrix.goos == 'android' && steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          NDK_VERSION="${{ env.NDK_VERSION }}"
+          NDK="${{ github.workspace }}/.ndk/android-ndk-${NDK_VERSION}"
+          zip="android-ndk-${NDK_VERSION}-linux.zip"
+          url="https://dl.google.com/android/repository/${zip}"
+
+          mkdir -p "$(dirname "$NDK")"
+          echo "Downloading $url"
+          wget -q --show-progress -O "/tmp/${zip}" "$url"
+          echo "Extracting..."
+          unzip -q "/tmp/${zip}" -d "$(dirname "$NDK")"
+          rm -f "/tmp/${zip}"
+
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          cat "$NDK/source.properties"
+
+      - name: Verify Android NDK
         if: matrix.goos == 'android'
         run: |
           set -euo pipefail
 
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends unzip zip wget
+          NDK="${{ github.workspace }}/.ndk/android-ndk-${{ env.NDK_VERSION }}"
+          API="${{ env.ANDROID_API_LEVEL }}"
+          PREBUILT="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          CLANG="$PREBUILT/bin/aarch64-linux-android${API}-clang"
 
-          # 安装 commandlinetools + NDK
-          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          cd /tmp
+          echo "NDK=$NDK"
+          echo "API=$API"
+          test -d "$NDK"
+          "$PREBUILT/bin/clang" --version | head -2
+          ls "$PREBUILT/bin" | grep -E "aarch64-linux-android${API}-clang$" | head -3
+          test -x "$CLANG"
+          echo "CC=$CLANG"
 
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
-          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
-          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" \
-            "ndk;${{ env.ANDROID_NDK_VERSION }}" \
-            "platforms;android-${{ env.ANDROID_API_LEVEL }}"
-
-          NDK_HOME="$ANDROID_SDK_ROOT/ndk/${{ env.ANDROID_NDK_VERSION }}"
-          if [ ! -d "$NDK_HOME" ]; then
-            echo "NDK not found at $NDK_HOME" >&2
-            ls -la "$ANDROID_SDK_ROOT/ndk" || true
-            exit 1
-          fi
-
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
-          echo "NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         run: |
+          set -euo pipefail
           brew list sqlite >/dev/null 2>&1 || brew install sqlite
           brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
 
@@ -221,6 +285,8 @@ jobs:
         id: meta
         shell: bash
         run: |
+          set -euo pipefail
+
           if [ -f VERSION ]; then
             VERSION="$(tr -d '[:space:]' < VERSION)"
           else
@@ -232,6 +298,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
           echo "git_commit=${GIT_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION} commit=${GIT_COMMIT} time=${BUILD_TIME}"
 
       - name: Build Go Backend
         shell: bash
@@ -246,11 +313,10 @@ jobs:
           CC="${{ matrix.cc }}"
           CXX=""
 
-          # --- 平台相关工具链 ---
           if [ "${{ matrix.goos }}" = "android" ]; then
-            # Android arm64 + NDK clang
-            PREBUILT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            NDK="${ANDROID_NDK_HOME:-${{ github.workspace }}/.ndk/android-ndk-${{ env.NDK_VERSION }}}"
             API="${{ env.ANDROID_API_LEVEL }}"
+            PREBUILT="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
             CC="$PREBUILT/bin/aarch64-linux-android${API}-clang"
             CXX="$PREBUILT/bin/aarch64-linux-android${API}-clang++"
 
@@ -261,10 +327,9 @@ jobs:
             fi
 
             export CC CXX
+            export CGO_ENABLED=1
             export CGO_CFLAGS="-fPIC"
             export CGO_LDFLAGS="-fPIC"
-            # mattn/go-sqlite3 会走 CGO，使用 NDK 编译内嵌 sqlite 源码
-            export CGO_ENABLED=1
 
           elif [ "${{ matrix.goos }}" = "darwin" ]; then
             export CC="$CC"
@@ -286,7 +351,7 @@ jobs:
             export CC="$CC"
           fi
 
-          echo "Building with GOOS=$GOOS GOARCH=$GOARCH CC=${CC:-default}"
+          echo "Building with GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED CC=${CC:-default}"
 
           go build -trimpath \
             -ldflags="-s -w \
@@ -295,6 +360,9 @@ jobs:
               -X ${{ env.GO_PACKAGE }}.BuildTime=${{ steps.meta.outputs.build_time }}" \
             -o "../deeix-chat${{ matrix.suffix }}" \
             ./cmd/server
+
+          file "../deeix-chat${{ matrix.suffix }}" || true
+          ls -lah "../deeix-chat${{ matrix.suffix }}"
 
       - name: Package Release Archive
         shell: bash
@@ -338,9 +406,15 @@ jobs:
           环境变量：
           FRONTEND_DIST_DIR=./frontend/out
 
+          运行示例：
+          export FRONTEND_DIST_DIR=./frontend/out
+          ./deeix-chat${{ matrix.suffix }}
+
           Android 说明：
           - 产物为 arm64 可执行文件，需在 Android 终端环境（如 Termux）中运行
           - 不是 APK；若需要安装包，请另行做 Android 壳工程封装
+          - min API: ${{ env.ANDROID_API_LEVEL }}
+          - NDK: ${{ env.NDK_VERSION }}
           EOF
 
           cd release-pkg
@@ -351,6 +425,8 @@ jobs:
           else
             tar -czf "../${ARCHIVE_BASE}.tar.gz" .
           fi
+
+          ls -lah ../deeix-chat-*
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@v4
@@ -379,6 +455,8 @@ jobs:
         id: release-meta
         shell: bash
         run: |
+          set -euo pipefail
+
           if [ -f VERSION ]; then
             VERSION="$(tr -d '[:space:]' < VERSION)"
           else
@@ -388,6 +466,7 @@ jobs:
           SAFE_TAG="$(echo "deeix-chat-${VERSION}" | sed 's/[^A-Za-z0-9._-]/-/g')"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SAFE_TAG} version=${VERSION}"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -396,9 +475,11 @@ jobs:
 
       - name: Flatten directory structure
         run: |
+          set -euo pipefail
           mkdir -p release-files
           find all-artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
           ls -lah release-files
+          test "$(find release-files -type f | wc -l)" -gt 0
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -421,7 +502,7 @@ jobs:
             - Linux amd64 / arm64
             - Windows amd64
             - macOS amd64 / arm64
-            - Android arm64（二进制，非 APK）
+            - Android arm64（二进制，非 APK；min API `${{ inputs.android_api }}`，NDK `${{ inputs.ndk_version }}`）
 
             ### 运行示例
             ```bash
